@@ -6,7 +6,6 @@ require 'optparse'
 require 'uri'
 require 'net/http'
 require 'json'
-require 'logger'
 
 require 'openai'
 
@@ -16,7 +15,7 @@ LOG_FILE = 'rllm.log'
 options = {}
 
 repo_dir = '/home/snajpa/linux'
-src_commit = 'ccb98ccef0e5' # 6.13-rc5
+src_commit = '0bc21e701a6f' # 6.13-rc5
 cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e'
 #cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68'
 dst_branch_name = 'vpsadminos-6.13'
@@ -32,10 +31,6 @@ OptionParser.new do |opts|
   opts.banner = "Usage: rllm.rb [options]"
 end.parse!
 
-logger = Logger.new(LOG_FILE, 'daily')
-logger.level = Logger::DEBUG
-
-
 repo = Rugged::Repository.new(repo_dir)
 
 llmc = OpenAI::Client.new
@@ -45,8 +40,6 @@ walker = Rugged::Walker.new(repo)
 walker.push(repo.lookup(range[1]).oid)
 walker.hide(repo.lookup(range[0]).oid)
 commit_list = walker.map(&:oid).reverse
-
-p commit_list
 
 # Delete dst branch if exists, create new one from src_commit and then cherrypick commits
 repo.reset(repo.lookup(src_commit).oid, :hard)
@@ -61,42 +54,53 @@ commit_obj = repo.lookup(src_commit)
 repo.branches.create(dst_branch_name, commit_obj.oid)
 repo.checkout("refs/heads/#{dst_branch_name}")
 
-def build_merge_prompt(conflicted_content, commit_message, commit_diff)
+def build_merge_prompt(conflicted_content, commit_details, path)
   <<~PROMPT
-    You are resolving a Git merge conflict in a Linux kernel patch.
+    You are resolving a Git merge conflict.
+
+    Carefully read these instructions, then the original commit and the code block with a conflict to be merged.
+
+    Your task is to resolve the conflict in the code block by merging the code from the original commit and the code from the branch we're merging on top of.
+
+    Finish the merge by resolving the conflict in the code block:
+    - Be mindful of the full context of the commit and the code block.
+    - Resolve conflicts in the block in full spirit of the original commit.
+    - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
+    - If the commit rearranges or refactors code, ensure that the final code block is refactored in the same way.
+    - Prepend the lines with correct line numbers in your response.
+
+    Note:
+    - If you intend to comment on your reasoning or approach, please do so before you open the code block.
+    - You are forbidden to comment your actions in the code block itself.
+    - Consider the possibility, that the properly merged block might belong to a different file:
+      - When the original commit rearranges code and we're merging on top of a changed version of such code, we need to put the block to its new place as well.
+      - If this is the case, please provide the full path to the file in the response.
+      - Use a dedicated line prepended with FILE_PATH: followed by the full path.
     
-    All cited code blocks are prepended with line numbers for your convenience.
+    The original commit:
 
-    The commit diff showing the intended changes for the whole file is:
     ```
-    #{commit_diff}
-    ```
-
-    The commit message providing context is:
-    ```
-    #{commit_message}
+    #{commit_details}
     ```
 
+    This is the code block with the conflict to be solved:
 
-    And most importantly, the conflicting content is:
+    FILE_PATH: `#{path}`
     ```
     #{conflicted_content}
     ```
 
-    Preserve all important changes from both sides where relevant.
-    Preserve code formatting and indentation.
-    Include line numbers in your response.
-
-    Please provide fully merged code block below.
+    Provide a fully integrated solved merged code block below.
 
   PROMPT
 end
 
+tree = nil
 commit_list.each do |sha|
   commit = repo.lookup(sha)
   puts
   puts "Attempting to cherry-pick commit #{sha}"
-  puts commit.message.split("\n")[0..10].join("\n")
+  puts commit.message.split("\n").first
 
   begin
     repo.cherrypick(commit)
@@ -148,8 +152,8 @@ commit_list.each do |sha|
         end
       end
 
-      context_lines_after = 5
-      context_lines_before = 5
+      context_lines_after = 8
+      context_lines_before = 8
       
       first_block = labeled_lines.select { |k, v| v[:merge_id] == 0 }
       #p labeled_lines
@@ -166,15 +170,26 @@ commit_list.each do |sha|
 
       conflicted_content = ""
       file_array.each_with_index do |line, index|
+        max_digits = first_block_end.to_s.length
         if index >= first_block_start && index <= first_block_end
-          conflicted_content += "%4d %s\n" % [index+1, line]
+          conflicted_content += "%#{max_digits}d %s\n" % [index+1, line]
         end
       end
 
-      commit_message = commit.message.split("\n").each_with_index.map { |line, index| "%4d %s" % [index + 1, line] }.join("\n")
-      commit_diff = repo.diff(commit.parents.first, commit, paths: [path]).patch.to_s.split("\n").each_with_index.map { |line, index| "%4d %s" % [index + 1, line] }.join("\n")
-    
-      prompt = build_merge_prompt(conflicted_content, commit_message, commit_diff)
+      #commit_message = commit.message.split("\n").each_with_index.map { |line, index| "%4d %s" % [index + 1, line] }.join("\n")
+      #commit_diff = repo.diff(commit.parents.first, commit, paths: [path]).patch.to_s.split("\n").each_with_index.map { |line, index| "%4d %s" % [index + 1, line] }.join("\n")
+      #commit_diff = repo.diff(commit.parents.first, commit).patch.to_s.split("\n").each_with_index.map { |line, index| "%4d %s" % [index + 1, line] }.join("\n")
+      commit_message = commit.message
+      commit_diff = repo.diff(commit.parents.first, commit).patch.to_s
+      commit_details = commit_message + "\n" + commit_diff
+      commit_details = commit_details.split("\n")
+      max_digits = commit_details.size.to_s.length
+      commit_details = commit_details.each_with_index.map { |line, index| "%#{max_digits}d %s" % [index + 1, line] }.join("\n")
+      #commit_details = commit_details.each_with_index.map { |line, index| "%4d %s" % [index + 1, line] }.join("\n")
+
+      prompt = build_merge_prompt(conflicted_content, commit_details, path)
+
+      #puts "\n==================================\n#{prompt}\n==================================\n"
 
       puts conflicted_content
 
@@ -217,7 +232,7 @@ commit_list.each do |sha|
         solution_numbered_hash = {}
       
         solution_array.each_with_index do |line, index|
-          if line =~ /^(\s{0,3}\d{1,4}) (.*)$/
+          if line =~ /^(\s{0,5}\d{1,6}) (.*)$/
             solution_numbered_hash[$1.to_i-1] = $2
           end
         end
@@ -229,12 +244,14 @@ commit_list.each do |sha|
           next
         end
 
+        error = false
         solution_end.downto(solution_start) do |line_number|
           if !solution_numbered_hash.has_key?(line_number)
             puts "Missing line #{line_number}"
-            next
+            error = true
           end
         end
+        next if error
 
         new_content = []
 
@@ -271,7 +288,10 @@ commit_list.each do |sha|
     end
 
     ported_str = ""
-    ported_str = "\nPorted-by: rllm" if ported
+    if ported
+      ported_str = "\nPorted-by: rllm"
+      puts "Successfully resolved all conflicts in #{sha}"
+    end
 
     # Create commit if all conflicts are resolved
     if repo.index.conflicts.empty?
@@ -283,8 +303,9 @@ commit_list.each do |sha|
         parents: [repo.head.target],
         update_ref: 'HEAD'
       }
-      Rugged::Commit.create(repo, options)
-      puts "Successfully resolved conflicts and committed #{sha}"
+      res = Rugged::Commit.create(repo, options)
+      repo.index.write_tree(repo)
+      puts "Successfully committed #{sha} as #{res}"
     else
       puts "Failed to resolve all conflicts in #{sha}"
       exit
