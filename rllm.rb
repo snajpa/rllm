@@ -6,8 +6,12 @@ require 'optparse'
 require 'uri'
 require 'net/http'
 require 'json'
+require 'fileutils'
 
 require 'openai'
+
+# Configuration
+# CUDA_VISIBLE_DEVICES="0,1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -b 8192 -c 90000 -t 8 --host 0.0.0.0 --port 8081 -ctk q4_0 -ctv q4_0 -fa
 
 LLAMA_API_ENDPOINT = 'http://localhost:8081'
 LOG_FILE = 'rllm.log'
@@ -15,7 +19,8 @@ LOG_FILE = 'rllm.log'
 options = {}
 
 repo_dir = '/home/snajpa/linux'
-src_commit = '0bc21e701a6f' # 6.13-rc5
+#src_commit = '0bc21e701a6f' # 6.13-rc5+
+src_commit = '8155b4ef3466' # next-20240104
 cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e'
 #cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68'
 dst_branch_name = 'vpsadminos-6.13'
@@ -60,23 +65,22 @@ def build_merge_prompt(conflicted_content, commit_details, path)
 
     Carefully read these instructions, then the original commit and the code block with a conflict to be merged.
 
-    Your task is to resolve the conflict in the code block by merging the code from the original commit and the code from the branch we're merging on top of.
-
-    Finish the merge by resolving the conflict in the code block:
-    - Be mindful of the full context of the commit and the code block.
-    - Resolve conflicts in the block in full spirit of the original commit.
-    - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
-    - If the commit rearranges or refactors code, ensure that the final code block is refactored in the same way.
-    - Prepend the lines with correct line numbers in your response.
-
-    Note:
+    Instructions:
+    - Your task is to resolve the conflict in the code block by merging the code from the original commit and the code from the branch we're merging on top of.
+    - Finish the merge by resolving the conflict in the code block:
+      - Be mindful of the full context of the commit and the code block.
+      - Resolve conflicts in the block in full spirit of the original commit.
+      - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
+      - If the commit rearranges or refactors code, ensure that the final code block is refactored in the same way.
+      - Prepend the lines with correct line numbers in your response.
     - If you intend to comment on your reasoning or approach, please do so before you open the code block.
     - You are forbidden to comment your actions in the code block itself.
-    - Consider the possibility, that the properly merged block might belong to a different file:
-      - When the original commit rearranges code and we're merging on top of a changed version of such code, we need to put the block to its new place as well.
-      - If this is the case, please provide the full path to the file in the response.
-      - Use a dedicated line prepended with FILE_PATH: followed by the full path.
-    
+    - Use a dedicated line with FILE_PATH: `file/path` to indicate the new location of the block.
+    - Consider the possibility, that the original commit also rearranges code and we're merging on top of a changed version of such code, so we need to integrate those as well.
+      - If this is the case, produce a code block capturing the integrated changes of the local version, with the appropriate FILE_PATH target.
+      - Then in the next code block, provide the fully integrated solved merged code block minding the original commit.
+      - This is your main way how to avoid code duplication to produce correctly merged code.
+
     The original commit:
 
     ```
@@ -95,24 +99,28 @@ def build_merge_prompt(conflicted_content, commit_details, path)
   PROMPT
 end
 
-tree = nil
-commit_list.each do |sha|
-  commit = repo.lookup(sha)
-  puts
-  puts "Attempting to cherry-pick commit #{sha}"
-  puts commit.message.split("\n").first
+# Initialize repository state
+tree = repo.head.target.tree
 
+time_start = Time.now
+n_commits = commit_list.size
+n_commit = 0
+commit_list.each do |sha|
+  n_commit += 1
+  commit = repo.lookup(sha)
+  puts "\nProcessing commit #{n_commit}/#{n_commits}: #{sha[0..7]} - #{commit.message.split("\n").first}"
   begin
+    # Attempt cherry-pick
     repo.cherrypick(commit)
-    
     ported = false
     merge_blocks = 1
+
     while repo.index.conflicts? && merge_blocks > 0
       conflict = repo.index.conflicts.first
       path = conflict[:theirs][:path]
-      puts "Conflict detected in #{path}, resolving..."
-      
       full_path = File.join(repo.workdir, path)
+
+      # Process file content and get solution
       file_content = File.read(full_path) rescue ""
 
       file_array = file_content.split("\n")
@@ -160,6 +168,7 @@ commit_list.each do |sha|
       #p first_block
       if first_block.empty?
         puts "No merge blocks found in #{path}, possibly file is deleted, staging anyway"
+        exit # TODO: think about this
         File.unlink(full_path) rescue nil
         repo.index.remove(path) rescue nil
         next
@@ -176,22 +185,25 @@ commit_list.each do |sha|
         end
       end
 
-      #commit_message = commit.message.split("\n").each_with_index.map { |line, index| "%4d %s" % [index + 1, line] }.join("\n")
-      #commit_diff = repo.diff(commit.parents.first, commit, paths: [path]).patch.to_s.split("\n").each_with_index.map { |line, index| "%4d %s" % [index + 1, line] }.join("\n")
-      #commit_diff = repo.diff(commit.parents.first, commit).patch.to_s.split("\n").each_with_index.map { |line, index| "%4d %s" % [index + 1, line] }.join("\n")
       commit_message = commit.message
       commit_diff = repo.diff(commit.parents.first, commit).patch.to_s
-      commit_details = commit_message + "\n" + commit_diff
+      commit_details = "commit #{commit.oid}\n"  # Start with commit header
+      commit_details += "Author: #{commit.author[:name]} <#{commit.author[:email]}>\n"
+      commit_details += "Date:   #{commit.author[:time]}\n\n"
+      commit_details += "    " + commit.message.gsub("\n", "\n    ") + "\n"  # Indent message
+      commit_details += commit_diff
+
       commit_details = commit_details.split("\n")
       max_digits = commit_details.size.to_s.length
-      commit_details = commit_details.each_with_index.map { |line, index| "%#{max_digits}d %s" % [index + 1, line] }.join("\n")
-      #commit_details = commit_details.each_with_index.map { |line, index| "%4d %s" % [index + 1, line] }.join("\n")
+      commit_details = commit_details.each_with_index.map { |line, index| 
+        "%#{max_digits}d %s" % [index + 1, line]
+      }.join("\n")
 
       prompt = build_merge_prompt(conflicted_content, commit_details, path)
 
-      #puts "\n==================================\n#{prompt}\n==================================\n"
-
+      puts "Resolving conflict in #{path}:"
       puts conflicted_content
+      puts "LLM response:"
 
       response = ""
       catch(:close) do
@@ -209,10 +221,19 @@ commit_list.each do |sha|
                 response += "\n"
                 puts
                 throw :close 
+              elsif response.include?("BAIL")
+                response += "\n"
+                puts
+                throw :close
               end
             end
           }
         )
+      end
+
+      if response.include?("BAIL")
+        puts "Bailing out"
+        exit
       end
 
       blocks = response.split("\n").reverse
@@ -275,44 +296,60 @@ commit_list.each do |sha|
           end
         end
 
-        File.write(full_path, new_content.join("\n"))
-        if merge_blocks == 1
-          repo.index.add(path)
+        # Write resolved file
+        temp_path = "#{full_path}.tmp"
+        begin
+          File.open(temp_path, 'w') { |f| f.write(new_content.join("\n")) }
+          FileUtils.mv(temp_path, full_path)
+        rescue => e
+          FileUtils.rm(temp_path) if File.exist?(temp_path)
+          raise e
         end
-        ported = true
-      else
-        puts "Failed to get valid solution for #{path}"
-        exit
-        next
+
+        # Stage resolved file and mark as resolved
+        repo.index.add(path: path, oid: Rugged::Blob.from_workdir(repo, path), mode: 0100644)
+        repo.index.conflict_remove(path)
+
+        # Verify index is clean before creating tree
+        if !repo.index.conflicts?
+          new_tree = repo.index.write_tree(repo)
+          
+          commit_oid = Rugged::Commit.create(repo, {
+            tree: new_tree,
+            author: commit.author,
+            committer: commit.committer,
+            message: commit.message + " [ported]",
+            parents: [repo.head.target],
+            update_ref: 'HEAD'
+          })
+
+          repo.reset(commit_oid, :hard)
+          tree = repo.head.target.tree
+          
+          ported = true
+          merge_blocks -= 1
+        end
       end
     end
 
-    ported_str = ""
-    if ported
-      ported_str = "\nPorted-by: rllm"
-      puts "Successfully resolved all conflicts in #{sha}"
-    end
-
-    # Create commit if all conflicts are resolved
-    if repo.index.conflicts.empty?
-      options = {
-        tree: repo.index.write_tree(repo),
+    # Handle non-conflict case
+    if !ported
+      new_tree = repo.index.write_tree(repo)
+      commit_oid = Rugged::Commit.create(repo, {
+        tree: new_tree,
         author: commit.author,
         committer: commit.committer,
-        message: commit.message + ported_str,
+        message: commit.message + " [ported]",
         parents: [repo.head.target],
         update_ref: 'HEAD'
-      }
-      res = Rugged::Commit.create(repo, options)
-      repo.index.write_tree(repo)
-      puts "Successfully committed #{sha} as #{res}"
-    else
-      puts "Failed to resolve all conflicts in #{sha}"
-      exit
+      })
+      repo.reset(commit_oid, :hard)
+      tree = repo.head.target.tree
+      puts "Commited as #{commit_oid}"
     end
+
   rescue => e
-    puts "Error processing #{sha}: #{e}"
-    puts e.backtrace
-    exit
+    puts "Error processing commit #{sha}: #{e.message}"
+    raise
   end
 end
