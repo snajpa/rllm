@@ -9,9 +9,10 @@ require 'json'
 require 'fileutils'
 
 require 'openai'
+require 'net/ssh'
 
 # Configuration
-# CUDA_VISIBLE_DEVICES="0,1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -b 8192 -c 90000 -t 8 --host 0.0.0.0 --port 8081 -ctk q4_0 -ctv q4_0 -fa
+# CUDA_VISIBLE_DEVICES="0,1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -b 4096 -ub 1024 -c 80000 -t 8 --host 0.0.0.0 --port 8081 -ctk q4_0 -ctv q4_0 -fa
 
 LLAMA_API_ENDPOINT = 'http://localhost:8081'
 LOG_FILE = 'rllm.log'
@@ -19,11 +20,14 @@ LOG_FILE = 'rllm.log'
 options = {}
 
 repo_dir = '/home/snajpa/linux'
+src_commit = '0bc21e701a6f' # os-wip
+cherrypick_commit_range = 'ed9ef699255e..0ed74379442a' # os-wip
 #src_commit = '0bc21e701a6f' # 6.13-rc5+
-src_commit = '8155b4ef3466' # next-20240104
-cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e'
-#cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68'
-dst_branch_name = 'vpsadminos-6.13'
+#cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e'
+#src_commit = '8155b4ef3466' # next-20240104
+#cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68' # from 6.12.7
+dst_branch_name = 'vpsadminos-devel'
+dst_remote_name = 'origin'
 
 OpenAI.configure do |config|
   config.access_token = ""
@@ -186,7 +190,7 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name)
           - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
           - If the commit rearranges or refactors code, ensure that the final code block is refactored in the same way.
           - Prepend the lines with correct line numbers in your response.
-        - If you intend to comment on your reasoning or approach, please do so before you open the code block.
+        - If you intend to comment on your reasoning or approach, please do so after the code block.
         - You are forbidden to comment your actions in the code block itself.
         - Use a dedicated line with FILE_PATH: `file/path` to indicate the new location of the block.
 
@@ -224,12 +228,9 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name)
 
                 block_marker_count = response.split("\n").select { |line| line.start_with?("```") }.size
                 
-                if block_marker_count == 4
+                if block_marker_count == 2
                   response += "\n"
                   throw :close 
-                elsif response.include?("BAIL")
-                  response += "\n"
-                  throw :close
                 end
               end
             }
@@ -237,11 +238,6 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name)
         end
         puts
         porting_step[:response] = response
-
-        if response.include?("BAIL")
-          puts "Bailing out"
-          exit
-        end
 
         blocks = response.split("\n").reverse
         solution = ""
@@ -374,6 +370,67 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name)
   merge_results
 end
 
+def force_push(repo_dir, dst_remote_name, dst_branch_name)
+  `cd #{repo_dir} && git push -f #{dst_remote_name} #{dst_branch_name}`
+  $?
+end
+
+
+def ssh_build_iteration(dst_remote_name, dst_branch_name, dir)
+  output_lines = []
+  ssh_options = {
+   # verbose: :debug,
+    use_agent: true,
+    config: true,
+    verify_host_key: :never
+  }
+
+  commands = [
+    { cmd: "cd #{dir}; git fetch", can_fail: false },
+    { cmd: "cd #{dir}; git checkout -f master", can_fail: false },
+    { cmd: "cd #{dir}; git branch -D #{dst_branch_name}", can_fail: true },
+    #{ cmd: "cd #{dir}; git reset --hard #{dst_remote_name}/#{dst_branch_name}", can_fail: true },
+    { cmd: "cd #{dir}; git checkout --progress -b #{dst_branch_name} #{dst_remote_name}/#{dst_branch_name}", can_fail: false },
+    { cmd: "cd #{dir}; echo build; make -j 64 V=1", can_fail: true }
+  ]
+
+  begin
+    Net::SSH.start('172.16.106.12', 'root', ssh_options) do |ssh|
+      commands.each do |command|
+        result = ssh.exec!(command[:cmd])
+        output_lines.concat(result.split("\n"))  # Collect each line of output
+        puts result  # Echo to console
+        
+        # Check exit status (net-ssh doesn't return exit status directly)
+        exit_status = ssh.exec!("echo $?").strip.to_i
+
+        if exit_status != 0 && !command[:can_fail]
+          return { failed: true, message: "Command failed: #{command[:cmd]}", output_lines: output_lines }
+        end
+      end
+    rescue Interrupt
+      return { failed: true, message: "Interrupted", output_lines: output_lines }
+    rescue => e
+      return { failed: true, message: e.message, output_lines: output_lines }
+    end
+  end
+
+  { failed: false, message: "Success", output_lines: output_lines }
+end
+
+
+
 m = merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name)
 
-puts JSON.pretty_generate(m)
+p m
+f = File.open('merge_results.json', 'w')
+m.to_json(max_nesting: false)
+f.close
+
+f = force_push(repo_dir, dst_remote_name, dst_branch_name)
+exit unless f.exitstatus == 0
+
+b = ssh_build_iteration(dst_remote_name, dst_branch_name, "~/linux")
+p b
+
+exit
