@@ -29,7 +29,7 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
       porting_steps = []
       pending_merge_blocks = 1
 
-      while repo.index.conflicts? && pending_merge_blocks > 0
+      while repo.index.conflicts?
         unless porting_step.empty?
           porting_steps << porting_steps
         end
@@ -165,15 +165,14 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
 
         Instructions:
         - Your task is to resolve the conflict in the code block by merging the code from the original commit and the code from the branch we're merging on top of.
-        - Finish the merge by resolving the conflict in the code block:
-          - Be mindful of the full context of the commit and the code block.
-          - Resolve conflicts in the block in full spirit of the original commit.
-          - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
-          - If the commit rearranges or refactors code, ensure that the final code block is refactored in the same way.
-          - Prepend the lines with correct line numbers in your response.
-        - If you intend to comment on your reasoning or approach, please do so after the code block.
-        - You are forbidden to comment your actions in the code block itself.
-        - Use a dedicated line with FILE_PATH: `file/path` to indicate the new location of the block.
+        - Resolving the merge conflict in the code block provided below the original commit.
+        - Be mindful of the full context.
+        - Do only what is relevant for resolving the merge conflict.
+        - Resolve conflicts in full spirit of the original commit.
+        - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
+        - If the commit rearranges or refactors code, ensure that the final code is refactored in the same way.
+        - Correctly number the lines in the solved code block to match their new positions in the target file.
+        - Don't insert any  comments into the resolved merge code block itself.
 
         The original commit:
 
@@ -181,14 +180,16 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
         #{commit_details}
         ```
         #{error_context}
+
+        In file: #{path}
+
         This is the code block with the conflict to be solved:
 
-        FILE_PATH: `#{path}`
         ```
         #{conflicted_content}
         ```
 
-        Provide a fully integrated solved merged code block below.
+        Provide a fully integrated resolved merged code block with resolved conflicts below:
 
         PROMPT
     
@@ -202,7 +203,7 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
         catch(:close) do
           llmc.completions(
             parameters: {
-              temperature: 0.5,
+              temperature: 0.7,
               prompt: prompt,
               max_tokens: 128000,
               stream: proc do |chunk, _bytesize|

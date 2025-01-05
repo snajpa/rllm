@@ -95,6 +95,7 @@ def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
                 command[:exit_status] = data.read_long
                 unless quiet             
                   print "\r" + "Exit status: #{command[:exit_status]}"
+                  puts
                 end
                 if command[:exit_status] != 0 && !command[:can_fail]
                   ch.close
@@ -107,8 +108,8 @@ def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
         ch.wait
       end
     end
-  rescue Interrupt
-    return { failed: true, results: commands }
+ # rescue Interrupt
+ #   return { failed: true, results: commands }
   rescue => e
     puts e.message
     puts e.backtrace unless quiet
@@ -135,7 +136,6 @@ puts "Cherrypick commit range: #{cherrypick_commit_range}"
 puts "Destination branch: #{dst_branch_name}"
 puts "Destination remote: #{dst_remote_name}"
 puts "Repository: #{repo_dir}"
-puts
 
 prev_results = {}
 error_context = ""
