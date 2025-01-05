@@ -75,7 +75,7 @@ def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
 
               ch.on_data do |_, data|
                 data.split("\n").each do |line|
-                  puts line unless quiet
+                  print "\r" + line.gsub(/\r\n?/, "\n") unless quiet
                   command[:output_lines] << line
                   block.call(ch, command, line) if block
                 end
@@ -83,15 +83,19 @@ def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
 
               ch.on_extended_data do |_, _, data|
                 data.split("\n").each do |line|
-                  puts line unless quiet
+                  unless quiet
+                    print "\r" + line.gsub(/\r\n?/, "\n")
+                  end
                   command[:output_lines] << line
                   block.call(ch, command, line) if block
                 end
               end
 
               ch.on_request("exit-status") do |_, data|
-                command[:exit_status] = data.read_long                
-                puts "Exit status: #{command[:exit_status]}" unless quiet
+                command[:exit_status] = data.read_long
+                unless quiet             
+                  print "\r" + "Exit status: #{command[:exit_status]}"
+                end
                 if command[:exit_status] != 0 && !command[:can_fail]
                   ch.close
                   raise
@@ -196,5 +200,14 @@ until compiled_ok
   # Then we apply the changes and try to compile again
   # If the compilation fails again, we repeat the process 3 times and then let's do a new round of merge
   # 
-  
+
+  if !compiled_ok && error_context.length > 0
+    # Attempt automated fixes
+    puts "Build failed, attempting automated fixes..."
+    compiled_ok = attempt_llm_fix(llmc, error_context, repo, prev_results[:porting_steps])
+    
+    if !compiled_ok
+      puts "Automated fixes failed after 3 attempts, continuing with next merge iteration"
+    end
+  end
 end

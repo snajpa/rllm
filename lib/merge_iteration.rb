@@ -38,6 +38,8 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
         path = conflict[:theirs][:path]
         full_path = File.join(repo.workdir, path)
 
+        puts "Resolving conflicts in #{path}"
+
         # Process file content and get solution
         file_content = File.read(full_path) rescue ""
 
@@ -77,6 +79,8 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
             pending_merge_blocks += 1
           end
         end
+
+        puts "\Pending merge blocks: #{pending_merge_blocks}\n\n"
 
         context_lines_after = 8
         context_lines_before = 8
@@ -190,7 +194,7 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
     
         puts "Resolving conflict in #{path}:"
         puts conflicted_content
-        puts prompt
+        #puts prompt
         puts "LLM response:"
         porting_step[:prompt] = prompt
 
@@ -198,6 +202,7 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
         catch(:close) do
           llmc.completions(
             parameters: {
+              temperature: 0.5,
               prompt: prompt,
               max_tokens: 128000,
               stream: proc do |chunk, _bytesize|
@@ -279,7 +284,6 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
               new_content << line
             end
           end
-
           # Write resolved file
           temp_path = "#{full_path}.tmp"
           begin
@@ -292,6 +296,7 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
 
           pending_merge_blocks -= 1
           ported = true
+
           porting_step[:resolved_mergeblocks] << {
             sha: sha,
             path: path,
@@ -301,18 +306,21 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
             solution: solution
           }
 
+
           # Stage resolved file and mark as resolved
-          repo.index.add(path: path, oid: Rugged::Blob.from_workdir(repo, path), mode: 0100644)
-          if pending_merge_blocks == 0
+          current_full_mode = repo.head.target.tree.path(path)[:filemode]
+          repo.index.add(path: path, oid: Rugged::Blob.from_workdir(repo, path), mode: current_full_mode)
+          if pending_merge_blocks > 0
+            next
+          else
             repo.index.conflict_remove(path)
+            repo.index.write
           end
 
           # Verify index is clean before creating tree
           if !repo.index.conflicts?
-            new_tree = repo.index.write_tree(repo)
-            
             commit_oid = Rugged::Commit.create(repo, {
-              tree: new_tree,
+              tree: repo.index.write_tree(repo),
               author: commit.author,
               committer: commit.committer,
               message: commit.message + " [ported]",
@@ -321,8 +329,6 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
             })
             repo.reset(commit_oid, :hard)
             puts "Commited as #{commit_oid}"
-
-            ported = true
           end
         end
         unless porting_step.empty?
@@ -331,19 +337,30 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
       end
 
       # Handle non-conflict case
-      if !ported
-        new_tree = repo.index.write_tree(repo)
+      if !ported && !repo.index.conflicts?
         commit_oid = Rugged::Commit.create(repo, {
-          tree: new_tree,
+          tree: repo.index.write_tree(repo),
           author: commit.author,
           committer: commit.committer,
-          message: commit.message + " [ported]",
+          message: commit.message + " [rllm-ported]",
           parents: [repo.head.target],
           update_ref: 'HEAD'
         })
         repo.reset(commit_oid, :hard)
         puts "Commited as #{commit_oid}"
+      else
+        # Debug conflicted files before write_tree
+        repo.index.conflicts.each do |conflict|
+          puts "Conflict in: #{conflict[:ancestor]&.fetch(:path) || conflict[:ours]&.fetch(:path) || conflict[:theirs]&.fetch(:path)}"
+          puts "  Ancestor: #{conflict[:ancestor]&.fetch(:oid)}"
+          puts "  Ours: #{conflict[:ours]&.fetch(:oid)}" 
+          puts "  Theirs: #{conflict[:theirs]&.fetch(:oid)}"
+        end
       end
+      if commit_oid.nil?
+        puts "Failed to commit #{sha}"
+        exit
+      end       
       merge_results[sha][:llm_ported] = ported
       merge_results[sha][:resolved] = true
       merge_results[sha][:commited_as] = commit_oid

@@ -1,39 +1,101 @@
-def attempt_llm_fix(build_output, repo, patches)
+def attempt_llm_fix(llmc, error_output, repo, patches)
   max_attempts = 3
   attempts = 0
 
   while attempts < max_attempts
-    # Extract error information
-    errors = parse_build_errors(build_output)
+    errors = parse_build_errors(error_output)
     return true if errors.empty?
 
-    # Group errors by file
+    puts "\n=== Fix Attempt #{attempts + 1}/#{max_attempts} ==="
+    puts "Found #{errors.length} compilation errors to fix"
+
     file_errors = errors.group_by { |e| e[:file] }
+    fixed_any = false
 
-    file_errors.each do |file, errors|
-      # Find related patch
+    file_errors.each do |file, file_errors|
+      puts "\nProcessing file: #{file}"
+      puts "#{file_errors.length} errors found"
+      
       patch = find_related_patch(file, patches)
-      next unless patch
+      unless patch
+        puts "No related patch found, skipping..."
+        next
+      end
 
-      # Gather context
-      context = get_file_context(repo, file, errors)
+      context = get_file_context(repo, file, file_errors)
+      prompt = create_fix_prompt(context, patch, file_errors)
 
-      # Create LLM prompt
-      prompt = create_fix_prompt(context, patch, errors)
+      puts "\nRequesting LLM fix suggestion..."
+      puts "Context size: #{context.size} lines"
+      
+      fixes = {}
+      current_file = nil
+      current_code = []
+      
+      # Stream LLM response
+      catch(:close) do
+        llmc.completions(
+          parameters: {
+            prompt: prompt,
+            max_tokens: 128000,
+            stream: true
+          }
+        ) do |chunk|
+          if chunk.dig("choices", 0, "finish_reason") == "stop"
+            if current_file
+              fixes[current_file] = current_code.join("\n")
+            end
+          else
+            content = chunk.dig("choices", 0, "text").to_s
+            print content
+            
+            content.each_line do |line|
+              if line =~ /^FILE_PATH:\s*(.+)$/
+                if current_file
+                  fixes[current_file] = current_code.join("\n")
+                  current_code = []
+                end
+                current_file = $1.strip
+              elsif current_file && line.strip !~ /^```/
+                current_code << line
+              end
+            end
+          end
+        end
+      end
+      puts
 
-      # Get LLM suggestion
-      fixes = get_llm_fixes(prompt)
+      next if fixes.empty?
 
-      # Apply fixes
+      puts "\nApplying fixes to #{fixes.keys.size} files..."
+      fixes.each do |fix_file, content|
+        puts "- #{fix_file}"
+      end
+      
       apply_fixes(repo, fixes)
+      fixed_any = true
     end
 
-    # Rebuild and check
-    build_result = rebuild_project
-    return true if build_result[:success]
+    if fixed_any
+      puts "\nCommitting fixes and rebuilding..."
+      repo.index.write
+      
+      force_push(repo.workdir, dst_remote_name, dst_branch_name)
+      
+      build_result = ssh_build_iteration("172.16.106.12", "root", ssh_options, 
+                                       false, dst_remote_name, dst_branch_name,
+                                       "~/linux-rllm", 64)
+      
+      if build_result[:results].last[:exit_status] == 0
+        puts "\nBuild successful after fixes!"
+        return true
+      end
+      
+      error_output = build_result[:results].last[:output_lines].join("\n")
+    end
 
     attempts += 1
-    build_output = build_result[:output]
+    puts "\nFix attempt #{attempts} failed..." if attempts < max_attempts
   end
 
   false
@@ -97,7 +159,7 @@ def create_fix_prompt(context, patch, errors)
   PROMPT
 end
 
-def get_llm_fixes(prompt)
+def get_llm_fixes(llmc, prompt)
   response = llmc.complete(prompt)
   parse_fixes_from_response(response)
 end
@@ -128,7 +190,51 @@ end
 def apply_fixes(repo, fixes)
   fixes.each do |file, content|
     full_path = File.join(repo.workdir, file)
-    File.write(full_path, content)
+    file_array = File.read(full_path).split("\n")
+    solution_array = content.split("\n")
+    solution_numbered_hash = {}
+    
+    solution_array.each_with_index do |line, index|
+      if line =~ /^(\s{0,5}\d{1,6}) (.*)$/
+        solution_numbered_hash[$1.to_i-1] = $2
+      end
+    end
+    
+    solution_start = solution_numbered_hash.keys.min
+    solution_end = solution_numbered_hash.keys.max
+    new_content = []
+
+    # Arrive at solution - same as merge_iteration
+    file_array.each_with_index do |line, index|
+      if index >= solution_end
+        break
+      end
+      if index < solution_start
+        new_content << line
+      end
+    end
+    
+    # Fill in solution
+    solution_numbered_hash.each do |line_number, line|
+      new_content << line
+    end
+    
+    # Fill in rest of file
+    file_array.each_with_index do |line, index|
+      if index > solution_end
+        new_content << line
+      end
+    end
+    
+    # Write resolved file with temp file safety
+    temp_path = "#{full_path}.tmp"
+    begin
+      File.open(temp_path, 'w') { |f| f.write(new_content.join("\n")) }
+      FileUtils.mv(temp_path, full_path)
+    rescue => e
+      FileUtils.rm(temp_path) if File.exist?(temp_path)
+      raise e
+    end
   end
 end
 
