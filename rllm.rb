@@ -75,7 +75,7 @@ def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
 
               ch.on_data do |_, data|
                 data.split("\n").each do |line|
-                  print "\r" + line.gsub(/\r\n?/, "\n") unless quiet
+                  print "\r" + line.gsub(/\r\n?/, "") unless quiet
                   command[:output_lines] << line
                   block.call(ch, command, line) if block
                 end
@@ -84,7 +84,7 @@ def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
               ch.on_extended_data do |_, _, data|
                 data.split("\n").each do |line|
                   unless quiet
-                    print "\r" + line.gsub(/\r\n?/, "\n")
+                    print "\r" + line.gsub(/\r\n?/, "")
                   end
                   command[:output_lines] << line
                   block.call(ch, command, line) if block
@@ -93,8 +93,9 @@ def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
 
               ch.on_request("exit-status") do |_, data|
                 command[:exit_status] = data.read_long
-                unless quiet             
-                  print "\r" + "Exit status: #{command[:exit_status]}"
+                unless quiet
+                  tty_width = `tput cols`.to_i
+                  print "\r" + "Exit status: #{command[:exit_status]}" + " " * (tty_width - 15) + "\n"
                   puts
                 end
                 if command[:exit_status] != 0 && !command[:can_fail]
@@ -141,11 +142,20 @@ prev_results = {}
 error_context = ""
 compiled_ok = false
 until compiled_ok
-  prev_results = merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_context, prev_results)
-
-  #f = File.open('merge_results.json', 'w')
-  #prev_results.to_json(max_nesting: false)
-  #f.close
+  # Load previous results and check if they are valid
+  if File.exist?('merge_results.bin') && prev_results.empty?
+    f = File.open('merge_results.bin', 'r')
+    prev_results = Marshal.load(f.read)
+    f.close
+    File.delete('merge_results.bin')
+    puts "Loaded previous merge results"
+  else
+    prev_results = merge_iteration(llmc, 0.8, repo, src_commit, commit_list, dst_branch_name, error_context, prev_results)
+    puts "Saving merge results"
+    f = File.open('merge_results.bin', 'w')
+    f.write(Marshal.dump(prev_results))
+    f.close
+  end
 
   f = force_push(repo_dir, dst_remote_name, dst_branch_name)
   exit unless f.exitstatus == 0
@@ -160,14 +170,14 @@ until compiled_ok
 
   # First we do a parallel fast build
   b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
-                          dst_remote_name, dst_branch_name, "~/linux-rllm", 64)# do |ch, command, line|
-    #if line =~ /error:/i
-    #  puts "Error detected, closing connection"
-    #  command[:exit_status] = 1
-    #  ch.close
-    #  raise
-    #end
-  #end
+                          dst_remote_name, dst_branch_name, "~/linux-rllm", 64) do |ch, command, line|
+    if line =~ /error:/i
+      puts "Error detected, closing connection"
+      command[:exit_status] = 1
+      ch.close
+      raise
+    end
+  end
 
   compiled_ok = b[:results].last[:exit_status] == 0
   break if compiled_ok

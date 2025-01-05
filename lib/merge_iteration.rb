@@ -1,4 +1,4 @@
-def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_context = "", prev_results = {})
+def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch_name, error_context = "", prev_results = {})
   merge_results = {}
 
   # Delete dst branch if exists, create new one from src_commit and then cherrypick commits
@@ -163,8 +163,10 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
 
         Carefully read these instructions, then the original commit and the code block with a conflict to be merged.
 
-        Instructions:
+        Task description:
         - Your task is to resolve the conflict in the code block by merging the code from the original commit and the code from the branch we're merging on top of.
+
+        Instructions:
         - Resolving the merge conflict in the code block provided below the original commit.
         - Be mindful of the full context.
         - Do only what is relevant for resolving the merge conflict.
@@ -172,7 +174,9 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
         - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
         - If the commit rearranges or refactors code, ensure that the final code is refactored in the same way.
         - Correctly number the lines in the solved code block to match their new positions in the target file.
-        - Don't insert any  comments into the resolved merge code block itself.
+
+        Constraints:
+        - Don't insert any comments into the resolved merge code block itself.
 
         The original commit:
 
@@ -189,7 +193,11 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
         #{conflicted_content}
         ```
 
-        Provide a fully integrated resolved merged code block with resolved conflicts below:
+        Now please focus and provide fully integrated resolved merged code block with correct line numbers.
+
+        ================================
+
+        Merged code block:
 
         PROMPT
     
@@ -203,7 +211,7 @@ def merge_iteration(llmc, repo, src_commit, commit_list, dst_branch_name, error_
         catch(:close) do
           llmc.completions(
             parameters: {
-              temperature: 0.7,
+              temperature: temperature,
               prompt: prompt,
               max_tokens: 128000,
               stream: proc do |chunk, _bytesize|
