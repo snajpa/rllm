@@ -15,6 +15,7 @@ require_relative './lib/merge_iteration'
 require_relative './lib/fixup_iteration'
 
 # Configuration
+# cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_F16=true -DGGML_CUDA_PEER_MAX_BATCH_SIZE=256 -DGGML_CUDA_FA_ALL_QUANTS=true
 # CUDA_VISIBLE_DEVICES="0,1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -b 4096 -ub 1024 -c 80000 -t 8 --host 0.0.0.0 --port 8081 -ctk q4_0 -ctv q4_0 -fa
 
 LLAMA_API_ENDPOINT = 'http://localhost:8081'
@@ -75,7 +76,7 @@ def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
 
               ch.on_data do |_, data|
                 data.split("\n").each do |line|
-                  print "\r" + line.gsub(/\r\n?/, "") unless quiet
+                  puts line unless quiet
                   command[:output_lines] << line
                   block.call(ch, command, line) if block
                 end
@@ -84,7 +85,7 @@ def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
               ch.on_extended_data do |_, _, data|
                 data.split("\n").each do |line|
                   unless quiet
-                    print "\r" + line.gsub(/\r\n?/, "")
+                    puts line unless quiet
                   end
                   command[:output_lines] << line
                   block.call(ch, command, line) if block
@@ -95,7 +96,7 @@ def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
                 command[:exit_status] = data.read_long
                 unless quiet
                   tty_width = `tput cols`.to_i
-                  print "\r" + "Exit status: #{command[:exit_status]}" + " " * (tty_width - 15) + "\n"
+                  print "Exit status: #{command[:exit_status]}" + " " * (tty_width - 15) + "\n"
                   puts
                 end
                 if command[:exit_status] != 0 && !command[:can_fail]
@@ -139,85 +140,94 @@ puts "Destination remote: #{dst_remote_name}"
 puts "Repository: #{repo_dir}"
 
 prev_results = {}
+if File.exist?('merge_results.bin') && prev_results.empty?
+  f = File.open('merge_results.bin', 'r')
+  prev_results = Marshal.load(f.read)
+  f.close
+  #File.delete('merge_results.bin')
+  puts "Loaded previous merge results"
+end
+
 error_context = ""
 compiled_ok = false
-until compiled_ok
-  # Load previous results and check if they are valid
-  if File.exist?('merge_results.bin') && prev_results.empty?
-    f = File.open('merge_results.bin', 'r')
-    prev_results = Marshal.load(f.read)
-    f.close
-    File.delete('merge_results.bin')
-    puts "Loaded previous merge results"
-  else
-    prev_results = merge_iteration(llmc, 0.8, repo, src_commit, commit_list, dst_branch_name, error_context, prev_results)
+begin
+  while !compiled_ok
+    prev_results = merge_iteration(llmc, 0.8, repo,
+                                   src_commit, commit_list, dst_branch_name,
+                                   384, error_context, prev_results)
     puts "Saving merge results"
     f = File.open('merge_results.bin', 'w')
     f.write(Marshal.dump(prev_results))
     f.close
-  end
 
-  f = force_push(repo_dir, dst_remote_name, dst_branch_name)
-  exit unless f.exitstatus == 0
+    f = force_push(repo_dir, dst_remote_name, dst_branch_name)
+    exit unless f.exitstatus == 0
 
-  quiet = false
-  ssh_options = {
-    # verbose: :debug,
-    use_agent: true,
-    config: true,
-    verify_host_key: :never
-  }
+    quiet = false
+    ssh_options = {
+      # verbose: :debug,
+      use_agent: true,
+      config: true,
+      verify_host_key: :never
+    }
 
-  # First we do a parallel fast build
-  b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
-                          dst_remote_name, dst_branch_name, "~/linux-rllm", 64) do |ch, command, line|
-    if line =~ /error:/i
-      puts "Error detected, closing connection"
-      command[:exit_status] = 1
-      ch.close
-      raise
+    # First we do a parallel fast build
+    #b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
+    #                        dst_remote_name, dst_branch_name, "~/linux-rllm", 64)# do |ch, command, line|
+    #  if line =~ /error:/i
+    #    puts "Error detected, closing connection"
+    #    command[:exit_status] = 1
+    #    ch.close
+    #    raise
+    #  end
+    #end
+
+    #compiled_ok = b[:results].last[:exit_status] == 0
+    #break if compiled_ok
+
+    b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
+                            dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
+
+    error_context_lines = []
+    was_error = false
+    b[:results].last[:output_lines].each do |line|
+      if line =~ /error:/i
+        was_error = true
+      end
+      if was_error
+        error_context_lines << line
+      end
     end
+    error_context = error_context_lines.join("\n")
+
+    puts "Compiled OK: #{compiled_ok}"
+
+    # If build failed, we're going to let the LLM to try to fix it
+    # First we need to identify all files that have had any compile issues such as errors or warnings
+    # Then we need to identify the lines that have had issues
+    # Then we need to identify which patch is most likely the cause of the issue
+    # Then we gather context around the lines that have had issues
+    # Then we send this information to the LLM along with the full patch to fix the issue by telling us which file it would like to change
+    # Then we provide the LLM with more context from the file around the lines that have had issues
+    # The we let the LLM provide any number of codeblocks prepended with FILE_PATH: `file/path` to indicate the new location of the block
+    # Then we apply the changes and try to compile again
+    # If the compilation fails again, we repeat the process 3 times and then let's do a new round of merge
+    # 
+
+    #if !compiled_ok && error_context.length > 0
+    #  # Attempt automated fixes
+    #  puts "Build failed, attempting automated fixes..."
+    #  compiled_ok = attempt_llm_fix(llmc, error_context, repo, prev_results[:porting_steps])
+    #  
+    #  if !compiled_ok
+    #    puts "Automated fixes failed after 3 attempts, continuing with next merge iteration"
+    #  end
+    #end
   end
-
-  compiled_ok = b[:results].last[:exit_status] == 0
-  break if compiled_ok
-
-  b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
-                          dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
-
-  error_context_lines = []
-  was_error = false
-  b[:results].last[:output_lines].each do |line|
-    if line =~ /error:/i
-      was_error = true
-    end
-    if was_error
-      error_context_lines << line
-    end
-  end
-  error_context = error_context_lines.join("\n")
-
-  puts "Compiled OK: #{compiled_ok}"
-
-  # If build failed, we're going to let the LLM to try to fix it
-  # First we need to identify all files that have had any compile issues such as errors or warnings
-  # Then we need to identify the lines that have had issues
-  # Then we need to identify which patch is most likely the cause of the issue
-  # Then we gather context around the lines that have had issues
-  # Then we send this information to the LLM along with the full patch to fix the issue by telling us which file it would like to change
-  # Then we provide the LLM with more context from the file around the lines that have had issues
-  # The we let the LLM provide any number of codeblocks prepended with FILE_PATH: `file/path` to indicate the new location of the block
-  # Then we apply the changes and try to compile again
-  # If the compilation fails again, we repeat the process 3 times and then let's do a new round of merge
-  # 
-
-  if !compiled_ok && error_context.length > 0
-    # Attempt automated fixes
-    puts "Build failed, attempting automated fixes..."
-    compiled_ok = attempt_llm_fix(llmc, error_context, repo, prev_results[:porting_steps])
-    
-    if !compiled_ok
-      puts "Automated fixes failed after 3 attempts, continuing with next merge iteration"
-    end
-  end
+rescue Interrupt => e
+  puts "Merge iteration interrupted: #{e.message}"
+  puts "Saving merge results"
+  f = File.open('merge_results.bin', 'w')
+  f.write(Marshal.dump(prev_results))
+  f.close
 end

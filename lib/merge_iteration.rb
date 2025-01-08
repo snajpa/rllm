@@ -1,24 +1,99 @@
-def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch_name, error_context = "", prev_results = {})
+def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch_name, reask_context_iters, build_output = "", prev_results = {})
   merge_results = {}
+  src_commit_obj = repo.lookup(src_commit)
+
+  # Prepare data if this is a continuation
+  puts "Preparing data for merge iteration"
+
+  error_lines = build_output.split("\n")
+  parsed_error_lines = []
+  error_files = []
+  puts "Preparing error context" unless error_lines.empty?
+  error_lines.each do |line|
+    # Ah, line might include terminal escape codes, let's strip them
+    ansi_regex = /\x1b(?:[@-Z\\-_]|\[[0-?]*[ -\/]*[@-~]|\][^@\x07]*[@\x07]|\x7f)/
+    line = line.gsub(ansi_regex, "")
+    match = line.match(/^(.+):(\d+):(\d+):(.+)$/)
+    p match
+
+    if match
+      type = ""
+      if match[4] =~ /error/i
+        type = "error"
+      elsif match[4] =~ /warning/i
+        type = "warning"
+      else
+        type = "unknown"
+      end
+      parsed_error_lines << {
+        file: match[1],
+        line: match[2].to_i,
+        column: match[3].to_i,
+        type: type,
+        message: match[4]
+      }
+      error_files << match[1]
+    end
+  end
+  puts "Error files:"
+  p error_files
+
+  error_files_context_h = {}
+  error_context_around = 8
+  error_files.uniq.each do |file|
+    puts "Processing for file: #{file}"
+    next unless File.exist?(File.join(repo.workdir, file))
+    error_file_lines = File.read(File.join(repo.workdir, file)).split("\n")
+    # Select context around error line + error line
+    parsed_error_lines.each do |error_line|
+      if error_line[:file] == file
+        start_line = [0, error_line[:line] - error_context_around].max
+        end_line = [error_file_lines.size - 1, error_line[:line] + error_context_around].min
+        
+        error_files_context_h[file] ||= {}
+        error_file_lines[start_line..end_line].each_with_index do |line, index|
+          error_files_context_h[file][start_line + index] = line
+        end
+      end
+    end
+    # it's a Hash of lines and we need to sort it by line number
+    error_files_context_h[file] = error_files_context_h[file].sort.to_h
+  end
+  puts "Error files context:"
+  p error_files_context_h
+
+  # Now we get the first line of commit message for each line for each file
+  #blamed_error_files_context_h = {}
+  #error_files_context_h.each do |file, context_h|
+  #  puts "Blaming for file: #{file}"
+  #  context_h.each do |line_number, line|
+  #    blame = repo.blame(file, new_start_line: line_number + 1, new_end_line: line_number + 1)
+  #    blamed_error_files_context_h[file] ||= {}
+  #    blamed_error_files_context_h[file][line_number] = blame[0][:orig_commit].message.split("\n").first
+  #  end
+  #end
+  #puts "Blamed error files context:"
+  #p blamed_error_files_context_h
+  # End of data preparation
 
   # Delete dst branch if exists, create new one from src_commit and then cherrypick commits
-  repo.reset(repo.lookup(src_commit).oid, :hard)
-  repo.checkout(repo.lookup(src_commit).oid)
+  repo.reset(src_commit_obj.oid, :hard)
+  repo.checkout(src_commit_obj.oid)
 
   begin
     repo.branches.delete(dst_branch_name)
   rescue Rugged::ReferenceError
   end
 
-  commit_obj = repo.lookup(src_commit)
-  repo.branches.create(dst_branch_name, commit_obj.oid)
+  repo.branches.create(dst_branch_name, src_commit_obj.oid)
   repo.checkout("refs/heads/#{dst_branch_name}")
+  reset_target = src_commit_obj.oid
 
   n_commits = commit_list.size
   n_commit = 0
   commit_list.each do |sha|
     merge_results[sha] = { llm_ported: false, resolved: false, commited_as: nil, porting_steps: [] }
-    n_commit += 1
+    n_commit = commit_list.index(sha) + 1
     commit = repo.lookup(sha)
     puts "\nProcessing commit #{n_commit}/#{n_commits}: #{sha[0..7]} - #{commit.message.split("\n").first}"
     begin
@@ -31,14 +106,13 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
 
       while repo.index.conflicts?
         unless porting_step.empty?
-          porting_steps << porting_steps
+          porting_steps << porting_step
         end
         porting_step = { reason: nil, resolved_mergeblocks: [] }
         conflict = repo.index.conflicts.first
         path = conflict[:theirs][:path]
+        puts "Working on #{path}:"
         full_path = File.join(repo.workdir, path)
-
-        puts "Resolving conflicts in #{path}"
 
         # Process file content and get solution
         file_content = File.read(full_path) rescue ""
@@ -104,11 +178,41 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
         porting_step[:first_block_start] = first_block_start
         porting_step[:first_block_end] = first_block_end
 
-        conflicted_content = ""
+        original_block = ""
+        # Get the file content from the immediate parent commit
+        parent_commit = commit.parents.first
+        parent_tree = parent_commit.tree
+        parent_blob = parent_tree.path(path)[:oid]
+        if parent_blob
+          parent_content = repo.lookup(parent_blob).content
+          parent_content_array = parent_content.split("\n")
+          max_digits = parent_content_array.size.to_s.length
+          parent_content_array.each_with_index do |line, index|
+            if index >= first_block_start && index <= first_block_end
+              original_block += "%#{max_digits}d %s\n" % [index+1, line]
+            end
+          end
+        end
+
+        old_block = ""
+        old_tree = commit.tree
+        old_blob = old_tree.path(path)[:oid]
+        if old_blob
+          old_content = repo.lookup(old_blob).content
+          old_content_array = old_content.split("\n")
+          max_digits = old_content_array.size.to_s.length
+          old_content_array.each_with_index do |line, index|
+            if index >= first_block_start && index <= first_block_end
+              old_block += "%#{max_digits}d %s\n" % [index+1, line]
+            end
+          end
+        end
+
+        conflicted_block = ""
         file_array.each_with_index do |line, index|
           max_digits = first_block_end.to_s.length
           if index >= first_block_start && index <= first_block_end
-            conflicted_content += "%#{max_digits}d %s\n" % [index+1, line]
+            conflicted_block += "%#{max_digits}d %s\n" % [index+1, line]
           end
         end
 
@@ -124,41 +228,46 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
         commit_details = commit_details.each_with_index.map { |line, index| 
           "%#{max_digits}d %s" % [index + 1, line]
         }.join("\n")
-        
-        unless prev_results.empty?
-          previous_solution = ""
+              
+        this_file_errors = parsed_error_lines.select { |error| error[:file] == path }
+        previous_solution = ""
+        if !prev_results.empty? &&
           prev_results.each do |sha, result|
-            result[:porting_steps].each do |step|
-              step[:resolved_mergeblocks].each do |mergeblock|
+            result[:porting_steps].each do |porting_step|
+              porting_step[:resolved_mergeblocks].each_with_index do |mergeblock, index|
                 if mergeblock[:sha] == sha && \
                    mergeblock[:path] == path && \
                    mergeblock[:mergeblock_start] == first_block_start && \
                    mergeblock[:mergeblock_end] == first_block_end
                   previous_solution = mergeblock[:solution]
                 end
-              end
+              end unless porting_step[:resolved_mergeblocks].empty?
             end
           end
 
-          error_context = <<~CONTEXT
+          if this_file_errors.size > 0
+            error_context = <<~CONTEXT
 
-          Note, you have already attempted to merge the code, but you have failed.
-        
-          Following is the output of the build process from the your previous failed attempt:
-        
-          ```
-          #{error_context}
-          ```
+            Following is the output of the build process from the your previous failed attempt:
 
-          We also provide you with your previous attempt to merge the code in this file at this offset:
-          ```
-          #{previous_solution}
-          ```
+            ```
+            #{error_context}
+            ```
 
-          CONTEXT
+            We also provide you with your previous attempt to merge the code in this file at this offset:
+            ```
+            #{previous_solution}
+            ```
+
+            CONTEXT
+          else
+            error_context = <<~CONTEXT
+
+            CONTEXT
+          end
         end
 
-        prompt = <<~PROMPT
+        prompt_common = <<~PROMPT
         You are resolving a Git merge conflict.
 
         Carefully read these instructions, then the original commit and the code block with a conflict to be merged.
@@ -176,24 +285,48 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
         - Correctly number the lines in the solved code block to match their new positions in the target file.
 
         Constraints:
-        - Don't insert any comments into the resolved merge code block itself.
+        - You are forbidden to insert any comments into the resolved merge code block itself.
 
-        The original commit:
+        This is the full commit we're now merging:
 
         ```
         #{commit_details}
         ```
+
+        For reference, this is the state of the code the commit works on:
+
+        ```
+        #{old_block}```
+  
+        Carefully mind the current state of code we're merging this commit onto:
+
+        ```
+        #{original_block}```
+
         #{error_context}
+        To the conflict you're going to solve - it is in file: #{path}
 
-        In file: #{path}
-
-        This is the code block with the conflict to be solved:
+        And finally and most importantly, this is the code block with the merge conflict you need to resolve:
 
         ```
-        #{conflicted_content}
-        ```
+        #{conflicted_block}```
 
-        Now please focus and provide fully integrated resolved merged code block with correct line numbers.
+        PROMPT
+
+        asked_block = ask_and_gather_context(repo, llmc, temperature, prompt_common, path, reask_context_iters)
+        #puts "Asked block: #{asked_block}"
+
+        prompt_mergeblock = <<~PROMPT
+        This is the additional context you asked for:
+
+        #{asked_block}
+        
+        To recapitulate, this is the code block with the merge conflict you need to resolve:
+
+        ```
+        #{conflicted_block}```
+
+        You can now start resolving the conflict. Provide fully integrated resolved merged code block below.
 
         ================================
 
@@ -202,17 +335,20 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
         PROMPT
     
         puts "Resolving conflict in #{path}:"
-        puts conflicted_content
-        #puts prompt
+
+        #puts prompt_common
+        #puts prompt_mergeblock
+        #puts conflicted_block
+        
         puts "LLM response:"
-        porting_step[:prompt] = prompt
+        porting_step[:prompt] = prompt_mergeblock
 
         response = ""
         catch(:close) do
           llmc.completions(
             parameters: {
               temperature: temperature,
-              prompt: prompt,
+              prompt: prompt_common + prompt_mergeblock,
               max_tokens: 128000,
               stream: proc do |chunk, _bytesize|
                 response += chunk["choices"].first["text"]
@@ -254,7 +390,7 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
           solution_start = solution_numbered_hash.keys.min
           solution_end = solution_numbered_hash.keys.max
         
-          if solution_start != first_block_start
+          if solution_start != first_block_start && this_file_errors.size == 0
             puts "Solution start (#{solution_start}) does not match first block start (#{first_block_start})"
             porting_step[:reason] = :solution_start_mismatch
             next
@@ -305,15 +441,15 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
 
           pending_merge_blocks -= 1
           ported = true
-
-          porting_step[:resolved_mergeblocks] << {
+          step = {
             sha: sha,
             path: path,
-            mergeblock: conflicted_content,
+            mergeblock: conflicted_block,
             mergeblock_start: first_block_start,
             mergeblock_end: first_block_end,
             solution: solution
           }
+          porting_step[:resolved_mergeblocks] << step
 
 
           # Stage resolved file and mark as resolved
@@ -338,6 +474,7 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
             })
             repo.reset(commit_oid, :hard)
             puts "Commited as #{commit_oid}"
+            reset_target = repo.lookup(commit_oid).oid
           end
         end
         unless porting_step.empty?
@@ -357,6 +494,7 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
         })
         repo.reset(commit_oid, :hard)
         puts "Commited as #{commit_oid}"
+        reset_target = repo.lookup(commit_oid).oid
       else
         # Debug conflicted files before write_tree
         repo.index.conflicts.each do |conflict|
@@ -377,9 +515,181 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
 
     rescue => e
       puts "Error processing commit #{sha}: #{e.message}"
-      raise
+      puts e.backtrace
+      repo.reset(reset_target, :hard)
+      exit #redo
     end
   end
 
   merge_results
+end
+
+def get_file_context(repo, path, linenumbers, context_lines = 8)
+  file_path = File.join(repo.workdir, path)
+  return "" unless File.exist?(file_path)
+  lines = File.read(file_path).split("\n")
+  context = {}
+  linenumbers.each do |linenumber|
+    start = [0, linenumber - context_lines].max
+    stop = [lines.size - 1, linenumber + context_lines].min
+    lines[start..stop].each_with_index do |line, index|
+      context[start + index] = line
+    end
+  end
+  max_digits = context.keys.max.to_s.length
+  context.sort.map { |k, v| "%#{max_digits}d %s" % [k+1, v] }.join("\n")
+end
+
+def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_lines)
+  iters = 0
+  valid_lines = 0
+  reask_block = ""
+  ask_block = ""
+  puts "Gathering context"
+  while valid_lines < max_lines
+    iters += 1
+
+    prompt_askcontext = <<~PROMPT
+    Now is your chance to ask for further context! If you need more information, please ask now.
+
+    When you're done, please type ASK: close to finish asking for context.
+
+    The format is an ask per line, per line format is ASK: <tool> <parameter1> [<parameter2> ...]. Available tools are:
+    - grep-context: <match_pattern> - search recursively for a pattern in the repo and print a bit more context around the matches
+    - cat-context: <line_number> <path> - show the context around a line in a file
+    - git-blame: <line_number> <path> - show the first line of commit message of a commit, which introduced a line in a file, runs git blame -L <line>,<line> <path>
+    - close - close the context asking
+
+    Consider each ask a separate question, and provide the context you need to resolve the conflict.
+
+    When you have sufficient context, type ASK: close to finish asking for context.
+
+    Note, that you have limited budget of lines to fill in the context, so use it wisely.
+
+    PROMPT
+
+    if ask_block.empty?
+      prompt_askcontext += <<~PROMPT
+      ```
+      Fictional example:
+
+      Your ask:
+      ASK: grep-rn hello
+      RESULT:
+      /path/to/file:1:hello world
+      LINES_BUDGET_LEFT: 10
+      ASK: close
+      RESULT:
+      Done asking for more context
+      ```
+  
+      Your ask:
+      ```
+      PROMPT
+    else
+      prompt_askcontext += "Your previous ask results:\n" + reask_block + "\n"
+      prompt_askcontext += <<~PROMPT
+      Your next ask:
+      ```
+      PROMPT
+    end
+    #puts prompt_common
+    #puts prompt_askcontext
+
+    ask = ""
+    catch(:close) do
+      llmc.completions(
+        parameters: {
+          temperature: temperature,
+          prompt: prompt_common + prompt_askcontext,
+          max_tokens: 128000,
+          stream: proc do |chunk, _bytesize|
+            ask += chunk["choices"].first["text"]
+
+            # only accept one line at a time
+            if ask.split("\n").size > 1
+              throw :close
+            end
+            if ask =~ /ASK: close/
+              ask += "\n"
+              throw :close
+            end
+          end
+        }
+      )
+    end
+
+    match = ask.split("\n").first.match(/^ASK: (grep-context|cat-context|git-blame|close)\s(.+)$/)
+
+    next if match.nil?
+    tool, params = match.captures
+
+    max_digits = max_lines.to_s.length
+    puts "%#{max_digits}d/%#{max_digits}d: %s %s\n" % [valid_lines, max_lines, tool, params]
+
+    result = ""
+    reask_result = ""
+    case tool
+    when "grep-context"
+      # First we need to run git grep -n <pattern> and then we need to get the context around each match
+      # We can use the same approach as in the error context gathering
+      pattern = params
+      if pattern.empty?
+        next
+      end
+      blame_result = `cd #{repo.workdir} && git grep -n -- #{Shellwords.escape(pattern)}`
+      filelines = {}
+      blame_result.each_line do |line|
+        match = line.encode("utf-8", replace: nil).match(/^(.+):(\d+):(.+)$/)
+        if match
+          file = match[1]
+          line_number = match[2].to_i
+          content = match[3]
+          filelines[file] ||= []
+          filelines[file] << line_number
+        end
+      end
+      next if filelines.empty?
+      filelines.each do |file, linenumbers|
+        next if linenumbers.empty?
+        context = get_file_context(repo, file, linenumbers, 1)
+        result += "\n#{file}:\n"
+        result += "```\n" + context + "\n```\n"
+      end
+    when "cat-context"
+      begin
+        line_number = params.split(" ")[0].to_i
+        file = params.split(" ")[1]
+      rescue
+        next
+      end
+      context = get_file_context(repo, file, [line_number], 4)
+      next if context.empty?
+      result = "\n#{file}:\n"
+      result += "```\n" + context + "```\n"
+    when "git-blame"
+      begin
+        line_number = params.split(" ")[0].to_i
+        file = params.split(" ")[1]
+      rescue
+        next
+      end
+      next unless File.exist?(File.join(repo.workdir, file))
+      result = `cd #{repo.workdir} && git blame -L #{line_number},#{line_number} -- #{Shellwords.escape(file)}`
+      next if result.empty?
+      result = "\n```\n#{result}```\n"
+    when "close"
+      break
+    end
+    maxlines = 80
+    if result.split("\n").size > maxlines 
+      reask_result += "\nResult of ASK: #{tool} #{params} was above #{maxlines} lines (#{result.split("\n").size}), please ask more specifically and/or better.\n"
+    else
+      valid_lines += result.split("\n").size
+      reask_result += "\nASK: #{tool} #{params}\nRESULT:\n" + result + "\nLINES_BUDGET_LEFT: #{max_lines - valid_lines}\n"
+    end
+    reask_block += reask_result
+    ask_block += result
+  end
+  ask_block
 end
