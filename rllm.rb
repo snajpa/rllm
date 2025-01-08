@@ -150,11 +150,14 @@ end
 
 error_context = ""
 compiled_ok = false
+max_iterations = 10
+iter = 0
 begin
-  while !compiled_ok
+  while !compiled_ok && iter < max_iterations
+    iter += 1
     prev_results = merge_iteration(llmc, 0.8, repo,
                                    src_commit, commit_list, dst_branch_name,
-                                   384, error_context, prev_results)
+                                   50*iter, 5*iter, error_context, prev_results)
     puts "Saving merge results"
     f = File.open('merge_results.bin', 'w')
     f.write(Marshal.dump(prev_results))
