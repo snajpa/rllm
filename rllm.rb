@@ -7,6 +7,7 @@ require 'uri'
 require 'net/http'
 require 'json'
 require 'fileutils'
+require 'pathname'
 
 require 'openai'
 require 'net/ssh'
@@ -16,9 +17,11 @@ require_relative './lib/fixup_iteration'
 
 # Configuration
 # cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_F16=true -DGGML_CUDA_PEER_MAX_BATCH_SIZE=256 -DGGML_CUDA_FA_ALL_QUANTS=true
-# CUDA_VISIBLE_DEVICES="0,1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -b 4096 -ub 1024 -c 80000 -t 8 --host 0.0.0.0 --port 8081 -ctk q4_0 -ctv q4_0 -fa
+# CUDA_VISIBLE_DEVICES="1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/granite-3.1-8b-instruct.Q8_0.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8080 -fa -ctk q4_0 -ctv q4_0
+# CUDA_VISIBLE_DEVICES="0,1,2" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8081 -fa -ctk q4_0 -ctv q4_0 -ts 20,5,20 -mg 1 -ub 512 -b 4096
 
-LLAMA_API_ENDPOINT = 'http://localhost:8081'
+LLAMA_API_ENDPOINT_GOOD_SLOW = 'http://localhost:8081'
+LLAMA_API_ENDPOINT_MEH_FAST = 'http://localhost:8080'
 LOG_FILE = 'rllm.log'
 
 options = {}
@@ -36,7 +39,7 @@ dst_remote_name = 'origin'
 OpenAI.configure do |config|
   config.access_token = ""
   config.log_errors = true
-  config.uri_base = LLAMA_API_ENDPOINT
+  config.uri_base = LLAMA_API_ENDPOINT_GOOD_SLOW
   config.request_timeout = 900
 end
 
@@ -47,6 +50,7 @@ end.parse!
 repo = Rugged::Repository.new(repo_dir)
 
 llmc = OpenAI::Client.new
+llmc_fast = OpenAI::Client.new(uri_base: LLAMA_API_ENDPOINT_MEH_FAST)
 
 range = cherrypick_commit_range.split('..')
 walker = Rugged::Walker.new(repo)
@@ -157,14 +161,19 @@ begin
     iter += 1
     prev_results = merge_iteration(llmc, 0.8, repo,
                                    src_commit, commit_list, dst_branch_name,
-                                   50*iter, 5*iter, error_context, prev_results)
+                                   llmc_fast, 200, 500, 15*iter, error_context, prev_results)
     puts "Saving merge results"
     f = File.open('merge_results.bin', 'w')
     f.write(Marshal.dump(prev_results))
     f.close
 
-    f = force_push(repo_dir, dst_remote_name, dst_branch_name)
-    exit unless f.exitstatus == 0
+    pushed = false
+    3.times do
+      f = force_push(repo_dir, dst_remote_name, dst_branch_name)
+      pushed = f.exitstatus == 0
+      break if pushed
+    end
+    exit 1 unless pushed
 
     quiet = false
     ssh_options = {

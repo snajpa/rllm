@@ -1,4 +1,4 @@
-def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch_name, reask_valid_lines, reask_iter_limit, build_output = "", prev_results = {})
+def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch_name, reask_llmc, reask_perask_lines, reask_valid_lines, reask_iter_limit, build_output = "", prev_results = {})
   merge_results = {}
   src_commit_obj = repo.lookup(src_commit)
 
@@ -154,7 +154,7 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
           end
         end
 
-        puts "\Pending merge blocks: #{pending_merge_blocks}\n\n"
+        puts "Pending merge blocks: #{pending_merge_blocks}"
 
         context_lines_after = 8
         context_lines_before = 8
@@ -313,7 +313,8 @@ def merge_iteration(llmc, temperature, repo, src_commit, commit_list, dst_branch
 
         PROMPT
 
-        asked_block = ask_and_gather_context(repo, llmc, temperature, prompt_common, path, reask_valid_lines, reask_iter_limit)
+        asked_block = ask_and_gather_context(repo, reask_llmc, temperature, prompt_common, path,
+                                             reask_perask_lines, reask_valid_lines, reask_iter_limit)
         #puts "Asked block: #{asked_block}"
 
         prompt_mergeblock = <<~PROMPT
@@ -527,37 +528,44 @@ end
 def get_file_context(repo, path, linenumbers, context_lines = 8)
   file_path = File.join(repo.workdir, path)
   return "" unless File.exist?(file_path)
-  lines = File.read(file_path).split("\n")
+  lines = File.read(file_path).split("\n") || []
+  return "" if lines.empty?
   context = {}
   linenumbers.each do |linenumber|
     start = [0, linenumber - context_lines].max
     stop = [lines.size - 1, linenumber + context_lines].min
-    lines[start..stop].each_with_index do |line, index|
-      context[start + index] = line
+    lines.each_with_index do |line, index|
+      if index >= start && index <= stop
+        context[start + index] = line
+      end
     end
   end
   max_digits = context.keys.max.to_s.length
   context.sort.map { |k, v| "%#{max_digits}d %s" % [k+1, v] }.join("\n")
 end
 
-def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_lines, reask_iter_limit)
+def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_perask_lines, max_valid_lines, reask_iter_limit)
   iters = 0
   valid_lines = 0
   reask_block = ""
   ask_block = ""
   puts "Gathering context"
-  while valid_lines < max_lines
+  while valid_lines < max_valid_lines
     iters += 1
     if iters > reask_iter_limit
       puts "Reached reask limit"
       break
     end
 
-    max_digits_l = max_lines.to_s.length
+    max_digits_l = max_valid_lines.to_s.length
     max_digits_i = reask_iter_limit.to_s.length
-    print "%#{max_digits_i}d/%#{max_digits_i}d iters %#{max_digits_l}d/%#{max_digits_l}d lines: " % [iters, reask_iter_limit, valid_lines, max_lines]
+    print "%#{max_digits_i}d/%#{max_digits_i}d iters %#{max_digits_l}d/%#{max_digits_l}d lines: " % [iters, reask_iter_limit, valid_lines, max_valid_lines]
 
     prompt_reask = <<~PROMPT
+
+    ============================================================================================
+
+
     Now is your chance to ask for further context! If you need more information, please ask now.
 
     When you're done, please type ASK: close to finish asking for context.
@@ -580,73 +588,93 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_lin
 
     When you have sufficient context, type ASK: close to finish asking for context.
 
-    Note, that you have limited budget of lines to fill in the context, so use it wisely.
+    Note, that you have limited budget of lines to fill in the context, so use it wisely. You don't have to spend it all, just ensure you have enough to resolve the conflict.
+
+    Please respond with one or more ASK: <tool> <parameter1> [<parameter2> ...] lines.
 
     PROMPT
 
     if ask_block.empty?
       prompt_reask += <<~PROMPT
-      ```
-      Fictional example:
+      
+      (No previous asks, example asks:)
 
-      Your ask:
+      Your ask now:
       ASK: grep-rn hello
+      
       RESULT:
-      /path/to/file:1:hello world
+      
+      In file1.txt:
+      ```
+      1 hello world
+      ```
+      
       LINES_BUDGET_LEFT: 10
+      
+      Your ask now:
+      
       ASK: close
+      
       RESULT:
+      
       Done asking for more context
-      ```
-  
-      Your ask:
-      ```
+      (End of example asks)
       PROMPT
     else
-      prompt_reask += "Your previous ask results:\n" + reask_block + "\n"
-      prompt_reask += <<~PROMPT
-      Your next ask:
-      ```
-      PROMPT
+      prompt_reask += "\nYour previous asks:\n" + reask_block + "\n"
     end
-    #puts prompt_common
+    prompt_reask += <<~PROMPT
+
+    LINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}
+    
+    Your ask now:
+    ```
+    PROMPT
+  #puts prompt_common
     #puts prompt_reask
 
     ask = ""
+    ask_match = nil
     catch(:close) do
       llmc.completions(
         parameters: {
           temperature: temperature,
           prompt: prompt_common + prompt_reask,
-          max_tokens: 128000,
+          max_tokens: 128,
           stream: proc do |chunk, _bytesize|
             ask += chunk["choices"].first["text"]
 
-            # only accept one line at a time
-            if ask.split("\n").size > 1
-              throw :close
-            end
-            if ask =~ /ASK: close/
-              ask += "\n"
+            if ask =~ /^ASK:.*\n$/
               throw :close
             end
           end
         }
       )
     end
-
-    match = ask.split("\n").first.match(/^ASK: (grep-context|cat-context|blame-line|close)\s(.+)$/)
-
-    if match.nil?
-      puts "Invalid ask format"
-      reask_block += "\nInvalid ask format, syntax is: ASK: <tool> <parameter1> [<parameter2> ...]\n"
+    ask.split("\n").each_with_index do |line, index|
+      ask_match = line.match(/^ASK: (grep-context|cat-context|blame-line|close)\s?(.+)?$/)
+      if !ask_match.nil?
+        break
+      end
+    end
+    if ask_match.nil?
+      #puts "Invalid ask format:\n#{ask}\n"
+      puts "N/A: Invalid ask format"
+      #reask_block += "\nInvalid ask format, syntax is: ASK: <tool> <parameter1> [<parameter2> ...]\n"
       next
     end
-    tool, params_str = match.captures
-    params_str = params_str
-    params = params_str.split(/\s(?=(?:[^"]|"[^"]*")*$)/)
+    tool, params_str = ask_match.captures
+    params_str ||= ""
+    params = []
+    params_str.split(/\s(?=(?:[^"]|"[^"]*")*$)/).each do |param|
+      if param.start_with?('"') && param.end_with?('"')
+        params << param[1..-2]
+      else
+        params << param
+      end
+    end
 
-    print "%s %s " % [tool, params_str]
+    print "%s %s" % [tool, params_str]
 
     result = ""
     case tool
@@ -658,9 +686,12 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_lin
         if File.exist?(File.join(repo.workdir, param))
           files << param
         elsif globbed_files = Dir.glob(File.join(repo.workdir, param)).select { |file| File.file?(file) }
-          files += globbed_files
+          globbed_files.each do |file|
+            relative_path = Pathname.new(file).relative_path_from(Pathname.new(repo.workdir)).to_s
+            files << relative_path
+          end
         else
-          puts "Invalid file or glob pattern: #{param}"
+          puts ": Invalid file or glob pattern: #{param}"
           reask_block += "\ASK: #{tool} #{params.join(" ")}\nRESULT:\nInvalid ask, file or glob pattern not found: #{param}\n"
           next
         end
@@ -669,14 +700,16 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_lin
         files = ['.']
       end
       if pattern.strip.empty?
+        puts ": Invalid ask"
         reask_block += "\ASK: #{tool} #{params.join(" ")}\nRESULT:\nInvalid ask, syntax is ASK: grep-context <pattern> <file1> [<file2> ...]\n"
         next
       end
       params = [pattern] + files
-      git_grep_result = `cd #{repo.workdir} && git grep --no-color -n #{Shellwords.escape(pattern)} -- #{Shellwords.escape(files.join(" "))}`
-      if git_grep_result.size > (max_lines - valid_lines)
-        puts "Over budget"
-        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was over budget by #{max_lines - valid_lines} lines, please ask more specifically and/or better.\n"
+      cmd = "cd #{repo.workdir} && git grep --no-color -n \"#{pattern}\" -- #{files.join(" ")}"
+      git_grep_result = `#{cmd}`
+      if git_grep_result.size > (max_valid_lines - valid_lines)
+        puts ": Over budget (wanted #{git_grep_result.size} lines, only #{max_valid_lines - valid_lines} available)"
+        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was over budget by #{max_valid_lines - valid_lines} lines, please ask more specifically and/or better.\n"
         next
       end
       filelines = {}
@@ -685,10 +718,19 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_lin
         if match
           file = match[1]
           line_number = match[2].to_i
-          content = match[3]
           filelines[file] ||= []
           filelines[file] << line_number
         end
+      end
+      if filelines.empty?
+        puts ": No matches found"
+        #puts "Files: #{files}"
+        #puts "Pattern: #{pattern}"
+        #puts "Result: #{git_grep_result}"
+        #puts "Command: #{cmd}"
+        ask_block += "\nNo grep matches found for pattern: #{pattern} in files: #{files.join(" ")}\n"
+        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was empty, please ask more specifically and/or better.\n"
+        next
       end
       filelines.each do |file, linenumbers|
         next if linenumbers.empty?
@@ -699,48 +741,63 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_lin
     when "cat-context"
       begin
         line_number = params[0].to_i
-        file = params[1]
+        file = params[1] || ""
       rescue
-        puts "Invalid ask"
+        puts ": Invalid ask"
         reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was invalid, please ask more specifically and/or better.\n"
         next
       end
+      if file.empty?
+        puts ": Path not given"
+        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was invalid, file path not given, syntax is ASK: cat-context <line_number> <relative_path>\n"
+        next
+      end
+      unless File.exist?(File.join(repo.workdir, file))
+        puts ": File not found"
+        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was invalid, file not found: #{file}\n"
+        next
+      end
       context = get_file_context(repo, file, [line_number], 4)
-      next if context.empty?
+      if context.empty?
+        puts ": Line not found"
+        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was invalid, line not found: #{line_number}\n"
+        next
+      end
       result = "\n#{file}:\n"
       result += "```\n" + context + "\n```\n"
+      puts
     when "blame-line"
       begin
         line_number = params[0].to_i
         file = params[1]
       rescue
-        puts "Invalid ask"
+        puts ": Invalid ask"
         next
       end
       unless File.exist?(File.join(repo.workdir, file))
-        puts "File not found"
+        puts ": File not found"
         reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was invalid, file not found: #{file}\n"
         next
       end
-      result = `cd #{repo.workdir} && git blame -L #{line_number},#{line_number} -- #{Shellwords.escape(file)}`
+      result = `cd #{repo.workdir} && git blame -L #{line_number},#{line_number} -- #{Shellwords.escape(file)} 2>&1`
       if result.empty?
-        puts "No blame found"
+        puts ": No blame found"
         reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was empty, please ask more specifically and/or better.\n"
         next
       end
       result = "\n```\n#{result}```\n"
+      puts
     when "close"
-      puts "Done"
+      puts
       break
     end
-    maxlines = 80
     result_lines = result.split("\n").size
-    if result_lines > maxlines 
-      reask_block += "\nResult of ASK: #{tool} #{params.join("")} was above #{maxlines} lines (#{result_lines}), please ask more specifically and/or better.\n"
+    if result_lines > max_perask_lines 
+      reask_block += "\nResult of ASK: #{tool} #{params.join("")} was above #{max_perask_lines} lines (#{result_lines}), please ask more specifically and/or better.\n"
     else
       valid_lines += result_lines
       ask_block += result
-      reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\n" + result + "LINES_BUDGET_LEFT: #{max_lines - valid_lines}\n"
+      reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\n" + result + "\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
     end
     puts
   end
