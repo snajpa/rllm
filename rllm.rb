@@ -143,6 +143,20 @@ puts "Destination branch: #{dst_branch_name}"
 puts "Destination remote: #{dst_remote_name}"
 puts "Repository: #{repo_dir}"
 
+def extract_error_context(b)
+  error_context_lines = []
+  was_error = false
+  b[:results].last[:output_lines].each do |line|
+    if line =~ /error:/i
+      was_error = true
+    end
+    if was_error
+      error_context_lines << line
+    end
+  end
+  error_context_lines.join("\n")
+end
+
 prev_results = {}
 if File.exist?('merge_results.bin') && prev_results.empty?
   f = File.open('merge_results.bin', 'r')
@@ -152,6 +166,13 @@ if File.exist?('merge_results.bin') && prev_results.empty?
   puts "Loaded previous merge results"
 end
 
+quiet = false
+ssh_options = {
+  # verbose: :debug,
+  use_agent: true,
+  config: true,
+  verify_host_key: :never
+}
 error_context = ""
 compiled_ok = false
 max_iterations = 10
@@ -161,7 +182,7 @@ begin
     iter += 1
     prev_results = merge_iteration(llmc, 0.8, repo,
                                    src_commit, commit_list, dst_branch_name,
-                                   llmc_fast, 200, 500, 15*iter, error_context, prev_results)
+                                   llmc_fast, 256, 512, 18*iter, error_context, prev_results)
     puts "Saving merge results"
     f = File.open('merge_results.bin', 'w')
     f.write(Marshal.dump(prev_results))
@@ -175,17 +196,9 @@ begin
     end
     exit 1 unless pushed
 
-    quiet = false
-    ssh_options = {
-      # verbose: :debug,
-      use_agent: true,
-      config: true,
-      verify_host_key: :never
-    }
-
-    # First we do a parallel fast build
-    #b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
-    #                        dst_remote_name, dst_branch_name, "~/linux-rllm", 64)# do |ch, command, line|
+    b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
+                            dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
+    #do |ch, command, line|
     #  if line =~ /error:/i
     #    puts "Error detected, closing connection"
     #    command[:exit_status] = 1
@@ -193,48 +206,27 @@ begin
     #    raise
     #  end
     #end
+    error_context = extract_error_context(b)
+    puts "Compiled OK: #{compiled_ok}"
 
-    #compiled_ok = b[:results].last[:exit_status] == 0
-    #break if compiled_ok
+    build_second = false
+    if !compiled_ok && error_context.length > 0
+      fixup_ok = fixup_iteration(llmc, 0.3, repo, error_context,
+                                 llmc_fast, 200, 600, 32)
+      if fixup_ok
+        puts "Fixup OK, retrying build"
+        build_second = true
+      else
+        puts "Fixup failed, continuing with next merge iteration"
+      end
+    end
+
+    next unless build_second
 
     b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
                             dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
-
-    error_context_lines = []
-    was_error = false
-    b[:results].last[:output_lines].each do |line|
-      if line =~ /error:/i
-        was_error = true
-      end
-      if was_error
-        error_context_lines << line
-      end
-    end
-    error_context = error_context_lines.join("\n")
-
+    error_context = extract_error_context(b)
     puts "Compiled OK: #{compiled_ok}"
-
-    # If build failed, we're going to let the LLM to try to fix it
-    # First we need to identify all files that have had any compile issues such as errors or warnings
-    # Then we need to identify the lines that have had issues
-    # Then we need to identify which patch is most likely the cause of the issue
-    # Then we gather context around the lines that have had issues
-    # Then we send this information to the LLM along with the full patch to fix the issue by telling us which file it would like to change
-    # Then we provide the LLM with more context from the file around the lines that have had issues
-    # The we let the LLM provide any number of codeblocks prepended with FILE_PATH: `file/path` to indicate the new location of the block
-    # Then we apply the changes and try to compile again
-    # If the compilation fails again, we repeat the process 3 times and then let's do a new round of merge
-    # 
-
-    #if !compiled_ok && error_context.length > 0
-    #  # Attempt automated fixes
-    #  puts "Build failed, attempting automated fixes..."
-    #  compiled_ok = attempt_llm_fix(llmc, error_context, repo, prev_results[:porting_steps])
-    #  
-    #  if !compiled_ok
-    #    puts "Automated fixes failed after 3 attempts, continuing with next merge iteration"
-    #  end
-    #end
   end
 rescue Interrupt => e
   puts "Merge iteration interrupted: #{e.message}"

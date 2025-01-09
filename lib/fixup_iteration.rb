@@ -1,250 +1,183 @@
-# def attempt_llm_fix(llmc, error_output, repo, patches)
-#   max_attempts = 3
-#   attempts = 0
-
-#   while attempts < max_attempts
-#     errors = parse_build_errors(error_output)
-#     return true if errors.empty?
-
-#     puts "\n=== Fix Attempt #{attempts + 1}/#{max_attempts} ==="
-#     puts "Found #{errors.length} compilation errors to fix"
-
-#     file_errors = errors.group_by { |e| e[:file] }
-#     fixed_any = false
-
-#     file_errors.each do |file, file_errors|
-#       puts "\nProcessing file: #{file}"
-#       puts "#{file_errors.length} errors found"
-      
-#       patch = find_related_patch(file, patches)
-#       unless patch
-#         puts "No related patch found, skipping..."
-#         next
-#       end
-
-#       context = get_file_context(repo, file, file_errors)
-#       prompt = create_fix_prompt(context, patch, file_errors)
-
-#       puts "\nRequesting LLM fix suggestion..."
-#       puts "Context size: #{context.size} lines"
-      
-#       fixes = {}
-#       current_file = nil
-#       current_code = []
-      
-#       # Stream LLM response
-#       catch(:close) do
-#         llmc.completions(
-#           parameters: {
-#             prompt: prompt,
-#             max_tokens: 128000,
-#             stream: true
-#           }
-#         ) do |chunk|
-#           if chunk.dig("choices", 0, "finish_reason") == "stop"
-#             if current_file
-#               fixes[current_file] = current_code.join("\n")
-#             end
-#           else
-#             content = chunk.dig("choices", 0, "text").to_s
-#             print content
-            
-#             content.each_line do |line|
-#               if line =~ /^FILE_PATH:\s*(.+)$/
-#                 if current_file
-#                   fixes[current_file] = current_code.join("\n")
-#                   current_code = []
-#                 end
-#                 current_file = $1.strip
-#               elsif current_file && line.strip !~ /^```/
-#                 current_code << line
-#               end
-#             end
-#           end
-#         end
-#       end
-#       puts
-
-#       next if fixes.empty?
-
-#       puts "\nApplying fixes to #{fixes.keys.size} files..."
-#       fixes.each do |fix_file, content|
-#         puts "- #{fix_file}"
-#       end
-      
-#       apply_fixes(repo, fixes)
-#       fixed_any = true
-#     end
-
-#     if fixed_any
-#       puts "\nCommitting fixes and rebuilding..."
-#       repo.index.write
-      
-#       force_push(repo.workdir, dst_remote_name, dst_branch_name)
-      
-#       build_result = ssh_build_iteration("172.16.106.12", "root", ssh_options, 
-#                                        false, dst_remote_name, dst_branch_name,
-#                                        "~/linux-rllm", 64)
-      
-#       if build_result[:results].last[:exit_status] == 0
-#         puts "\nBuild successful after fixes!"
-#         return true
-#       end
-      
-#       error_output = build_result[:results].last[:output_lines].join("\n")
-#     end
-
-#     attempts += 1
-#     puts "\nFix attempt #{attempts} failed..." if attempts < max_attempts
-#   end
-
-#   false
-# end
-
-# def parse_build_errors(build_output)
-#   errors = []
-#   build_output.each_line do |line|
-#     if line =~ /^(.+):(\d+):(\d+):\s+(error|warning):\s+(.+)$/
-#       errors << {
-#         file: $1,
-#         line: $2.to_i,
-#         column: $3.to_i,
-#         type: $4,
-#         message: $5.strip
-#       }
-#     end
-#   end
-#   errors
-# end
-
-# def find_related_patch(file, patches)
-#   patches.find { |p| p.file == file }
-# end
-
-# def get_file_context(repo, file, errors)
-#   content = File.read(File.join(repo.workdir, file))
-#   lines = content.lines
-
-#   context = {}
-#   errors.each do |error|
-#     start_line = [error[:line] - 10, 0].max
-#     end_line = [error[:line] + 10, lines.length].min
-    
-#     context[error[:line]] = {
-#       code: lines[start_line..end_line].join,
-#       error: error[:message]
-#     }
-#   end
-#   context
-# end
-
-# def create_fix_prompt(context, patch, errors)
-#   <<~PROMPT
-#     I need help fixing compilation errors in a Linux kernel patch.
-    
-#     Original patch:
-#     #{patch}
-    
-#     Compilation errors:
-#     #{errors.map { |e| "#{e[:file]}:#{e[:line]}: #{e[:message]}" }.join("\n")}
-    
-#     Relevant code context:
-#     #{context.map { |line, ctx| "Around line #{line}:\n#{ctx[:code]}\nError: #{ctx[:error]}\n" }.join("\n")}
-    
-#     Please provide fixes in the following format:
-#     FILE_PATH: path/to/file
-#     ```c
-#     // New code block
-#     ```
-#   PROMPT
-# end
-
-# def get_llm_fixes(llmc, prompt)
-#   response = llmc.complete(prompt)
-#   parse_fixes_from_response(response)
-# end
-
-# def parse_fixes_from_response(response)
-#   fixes = {}
-#   current_file = nil
-#   current_code = []
-
-#   response.each_line do |line|
-#     if line =~ /^FILE_PATH:\s*(.+)$/
-#       if current_file
-#         fixes[current_file] = current_code.join("\n")
-#         current_code = []
-#       end
-#       current_file = $1.strip
-#     elsif current_file && line.strip =~ /^```/
-#       next
-#     elsif current_file
-#       current_code << line
-#     end
-#   end
-
-#   fixes[current_file] = current_code.join("\n") if current_file
-#   fixes
-# end
-
-# def apply_fixes(repo, fixes)
-#   fixes.each do |file, content|
-#     full_path = File.join(repo.workdir, file)
-#     file_array = File.read(full_path).split("\n")
-#     solution_array = content.split("\n")
-#     solution_numbered_hash = {}
-    
-#     solution_array.each_with_index do |line, index|
-#       if line =~ /^(\s{0,5}\d{1,6}) (.*)$/
-#         solution_numbered_hash[$1.to_i-1] = $2
-#       end
-#     end
-    
-#     solution_start = solution_numbered_hash.keys.min
-#     solution_end = solution_numbered_hash.keys.max
-#     new_content = []
-
-#     # Arrive at solution - same as merge_iteration
-#     file_array.each_with_index do |line, index|
-#       if index >= solution_end
-#         break
-#       end
-#       if index < solution_start
-#         new_content << line
-#       end
-#     end
-    
-#     # Fill in solution
-#     solution_numbered_hash.each do |line_number, line|
-#       new_content << line
-#     end
-    
-#     # Fill in rest of file
-#     file_array.each_with_index do |line, index|
-#       if index > solution_end
-#         new_content << line
-#       end
-#     end
-    
-#     # Write resolved file with temp file safety
-#     temp_path = "#{full_path}.tmp"
-#     begin
-#       File.open(temp_path, 'w') { |f| f.write(new_content.join("\n")) }
-#       FileUtils.mv(temp_path, full_path)
-#     rescue => e
-#       FileUtils.rm(temp_path) if File.exist?(temp_path)
-#       raise e
-#     end
-#   end
-# end
-
-# def rebuild_project
-#   # Reuse existing ssh_build_iteration method
-#   b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
-#                          dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
+def apply_suggested_changes(repo, file, line_number, solution)
+  # Get current file content
+  full_path = File.join(repo.workdir, file)
+  return false unless File.exist?(full_path)
   
-#   {
-#     success: b[:results].last[:exit_status] == 0,
-#     output: b[:results].last[:output_lines].join("\n")
-#   }
-# end
+  file_array = File.read(full_path).split("\n")
+  solution_array = solution.split("\n")
+  solution_hash = {}
+  
+  # Parse numbered solution lines
+  solution_array.each do |line|
+    if line =~ /^(\s{0,5}\d{1,6}) (.*)$/
+      solution_hash[$1.to_i-1] = $2
+    end
+  end
+  
+  return false if solution_hash.empty?
+  
+  # Find solution boundaries
+  solution_start = solution_hash.keys.min 
+  solution_end = solution_hash.keys.max
+  
+  # Validate line numbers match
+  return false if solution_start != line_number
+  
+  # Create new content 
+  new_content = []
+  
+  # Keep content before change
+  file_array.each_with_index do |line, index|
+    break if index >= solution_start
+    new_content << line
+  end
+  
+  # Insert solution
+  solution_hash.each do |line_number, line|
+    new_content << line
+  end
+  
+  # Keep remaining content
+  file_array.each_with_index do |line, index|
+    next if index <= solution_end
+    new_content << line
+  end
+  
+  # Write updated file
+  temp_path = "#{full_path}.tmp"
+  begin
+    File.open(temp_path, 'w') { |f| f.write(new_content.join("\n")) }
+    FileUtils.mv(temp_path, full_path)
+    return true
+  rescue => e
+    FileUtils.rm(temp_path) if File.exist?(temp_path)
+    puts "Error applying changes: #{e}"
+    return false
+  end
+end
+
+def fixup_iteration(llmc, temperature, repo, build_output, reask_llmc, reask_perask_lines, reask_valid_lines, reask_iter_limit)
+  # 1) Strip ANSI codes, parse errors
+  ansi_regex = /\x1b(?:[@-Z\\-_]|\[[0-?]*[ -\/]*[@-~]|\][^@\x07]*[@\x07]|\x7f)/
+  error_lines = build_output.split("\n").map { |l| l.gsub(ansi_regex, "") }
+  parsed_error_lines = []
+  error_files = []
+
+  error_lines.each do |line|
+    match = line.match(/^(.+):(\d+):(\d+):(.+)$/)
+    next unless match
+    type = case
+           when match[4] =~ /error/i then "error"
+           when match[4] =~ /warning/i then "warning"
+           else "unknown"
+           end
+    parsed_error_lines << {
+      file: match[1],
+      line: match[2].to_i,
+      column: match[3].to_i,
+      type: type,
+      message: match[4]
+    }
+    error_files << match[1]
+  end
+  return true if parsed_error_lines.empty?
+
+  # 2) Gather around-error context
+  error_files_context = {}
+  error_files.uniq.each do |file|
+    file_path = File.join(repo.workdir, file)
+    next unless File.exist?(file_path)
+    lines_arr = File.read(file_path).split("\n")
+    relevant = parsed_error_lines.select { |err| err[:file] == file }
+    error_context_around = 8
+
+    relevant.each do |err|
+      start_line = [0, err[:line] - error_context_around - 1].max
+      end_line   = [lines_arr.size - 1, err[:line] + error_context_around - 1].min
+      slice = lines_arr[start_line..end_line]
+      (start_line..end_line).each_with_index do |lineno, idx|
+        error_files_context[file] ||= {}
+        error_files_context[file][lineno] = slice[idx]
+      end
+    end
+    error_files_context[file] = error_files_context[file].sort.to_h
+  end
+
+  # 3) For each error line, blame + gather context like in merge_iteration
+  error_files_context.each do |file, lines_h|
+    lines_h.each do |lineno, content|
+      blame = []
+      begin
+        blame = repo.blame(file, new_start_line: lineno + 1, new_end_line: lineno + 1)
+      rescue => e
+        puts "Blame error #{e}"
+      end
+
+      culprit_commit = blame[0][:orig_commit] rescue nil
+      culprit_subject = culprit_commit ? culprit_commit.message.to_s.split("\n").first : "<no commit>"
+      puts "\nFile: #{file}, line #{lineno + 1}, introduced by commit: #{culprit_subject}"
+
+      ask_block = ask_and_gather_context(
+        repo,
+        reask_llmc,
+        temperature,
+        "", # prompt_common
+        file,
+        reask_perask_lines,
+        reask_valid_lines,
+        reask_iter_limit
+      )
+
+      # Prepare LLM prompt with blame + user context
+      prompt = <<~PROMPT
+        We have an issue at #{file}:#{lineno + 1}, introduced by:
+        Commit subject: #{culprit_subject}
+
+        Additional context requested:
+        #{ask_block}
+
+        Please propose a fix referencing line #{lineno + 1}.
+      PROMPT
+
+      response = ""
+      catch(:close) do
+        llmc.completions(
+          parameters: {
+            temperature: temperature,
+            prompt: prompt,
+            max_tokens: 512,
+            stream: proc do |chunk, _bytesize|
+              response += chunk["choices"].first["text"]
+              print chunk["choices"].first["text"]
+              
+              if response.include?("```") && response.split("```").size >= 2
+                throw :close
+              end
+            end
+          }
+        )
+      end
+
+      # Extract code block from response
+      blocks = response.split("\n").reverse
+      solution = ""
+      in_block = false
+      blocks.each do |line|
+        if line.start_with?("```")
+          in_block = !in_block
+        elsif in_block
+          solution = line + "\n" + solution
+        end
+      end
+
+      if solution && apply_suggested_changes(repo, file, lineno, solution)
+        puts "Successfully applied changes to #{file}"
+      else
+        puts "Failed to apply changes to #{file}"
+      end
+    end
+  end
+
+  puts "fixup_iteration completed"
+  false
+end

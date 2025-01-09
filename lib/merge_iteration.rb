@@ -528,6 +528,7 @@ end
 def get_file_context(repo, path, linenumbers, context_lines = 8)
   file_path = File.join(repo.workdir, path)
   return "" unless File.exist?(file_path)
+  return "" if File.directory?(file_path)
   lines = File.read(file_path).split("\n") || []
   return "" if lines.empty?
   context = {}
@@ -572,16 +573,20 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
 
     The format is an ask per line, per line format is ASK: <tool> <parameter1> [<parameter2> ...]. Available tools are:
     - Grep with context:
-      - Syntax: ASK: grep-context <pattern> <relative_path_or_glob_pattern1> [<relative_path_or_glob_pattern2> ...]
+      - Syntax:
+          ASK: grep-context <pattern> <relative_path_or_glob_pattern1> [<relative_path_or_glob_pattern2> ...]
       - Description: search recursively for a pattern in the repo and print a bit more context around the matches
     - Cat with context:
-      - Syntax: ASK: cat-context <line_number> <relative_path>
+      - Syntax:
+          ASK: cat-context <line_number> <relative_path>
       - Description: show the context around a line in a file
     - Blame line:
-      - Syntax: ASK: blame-line <line_number> <relative_path>
+      - Syntax:
+          ASK: blame-line <line_number> <relative_path>
       - Description: show the git blame for a line in a file
     - Close the context gathering:
-      - Syntax: ASK: close
+      - Syntax:
+          ASK: close
       - Description: end the context gathering when sufficient context is gathered
 
     Consider each ask a separate question, and provide the context you need to resolve the conflict.
@@ -590,7 +595,8 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
 
     Note, that you have limited budget of lines to fill in the context, so use it wisely. You don't have to spend it all, just ensure you have enough to resolve the conflict.
 
-    Please respond with one or more ASK: <tool> <parameter1> [<parameter2> ...] lines.
+    Please respond with one ASK: <tool> <parameter1> [<parameter2> ...]
+
 
     PROMPT
 
@@ -692,7 +698,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
           end
         else
           puts ": Invalid file or glob pattern: #{param}"
-          reask_block += "\ASK: #{tool} #{params.join(" ")}\nRESULT:\nInvalid ask, file or glob pattern not found: #{param}\n"
+          #reask_block += "\ASK: #{tool} #{params.join(" ")}\nRESULT:\nInvalid ask, file or glob pattern not found: #{param}\n"
           next
         end
       end
@@ -701,7 +707,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
       end
       if pattern.strip.empty?
         puts ": Invalid ask"
-        reask_block += "\ASK: #{tool} #{params.join(" ")}\nRESULT:\nInvalid ask, syntax is ASK: grep-context <pattern> <file1> [<file2> ...]\n"
+        #reask_block += "\ASK: #{tool} #{params.join(" ")}\nRESULT:\nInvalid ask, syntax is ASK: grep-context <pattern> <file1> [<file2> ...]\n"
         next
       end
       params = [pattern] + files
