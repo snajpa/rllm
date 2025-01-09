@@ -607,7 +607,6 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
 
       Your ask now:
       ASK: grep-rn hello
-      
       RESULT:
       
       In file1.txt:
@@ -620,9 +619,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
       Your ask now:
       
       ASK: close
-      
       RESULT:
-      
       Done asking for more context
       (End of example asks)
       PROMPT
@@ -715,7 +712,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
       git_grep_result = `#{cmd}`
       if git_grep_result.size > (max_valid_lines - valid_lines)
         puts ": Over budget (wanted #{git_grep_result.size} lines, only #{max_valid_lines - valid_lines} available)"
-        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was over budget by #{max_valid_lines - valid_lines} lines, please ask more specifically and/or better.\n"
+        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nOver budget, wanted #{git_grep_result.size} lines, only #{max_valid_lines - valid_lines} available\n"
         next
       end
       filelines = {}
@@ -735,7 +732,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
         #puts "Result: #{git_grep_result}"
         #puts "Command: #{cmd}"
         ask_block += "\nNo grep matches found for pattern: #{pattern} in files: #{files.join(" ")}\n"
-        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was empty, please ask more specifically and/or better.\n"
+        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nNo grep matches found for pattern: #{pattern} in files: #{files.join(" ")}\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
         next
       end
       filelines.each do |file, linenumbers|
@@ -750,23 +747,23 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
         file = params[1] || ""
       rescue
         puts ": Invalid ask"
-        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was invalid, please ask more specifically and/or better.\n"
+        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nInvalid ask, syntax is ASK: cat-context <line_number> <relative_path>\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
         next
       end
       if file.empty?
         puts ": Path not given"
-        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was invalid, file path not given, syntax is ASK: cat-context <line_number> <relative_path>\n"
+        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nPath not given\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
         next
       end
-      unless File.exist?(File.join(repo.workdir, file))
+      if !File.exist?(File.join(repo.workdir, file))
         puts ": File not found"
-        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was invalid, file not found: #{file}\n"
+        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nFile not found: #{file}\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
         next
       end
       context = get_file_context(repo, file, [line_number], 4)
       if context.empty?
         puts ": Line not found"
-        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was invalid, line not found: #{line_number}\n"
+        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nLine not found: #{line_number}\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
         next
       end
       result = "\n#{file}:\n"
@@ -782,13 +779,13 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
       end
       unless File.exist?(File.join(repo.workdir, file))
         puts ": File not found"
-        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was invalid, file not found: #{file}\n"
+        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nFile not found: #{file}\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
         next
       end
       result = `cd #{repo.workdir} && git blame -L #{line_number},#{line_number} -- #{Shellwords.escape(file)} 2>&1`
       if result.empty?
         puts ": No blame found"
-        reask_block += "\nResult of ASK: #{tool} #{params.join(" ")} was empty, please ask more specifically and/or better.\n"
+        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nNo blame found for line: #{line_number} in file: #{file}\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
         next
       end
       result = "\n```\n#{result}```\n"
@@ -799,13 +796,12 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, path, max_per
     end
     result_lines = result.split("\n").size
     if result_lines > max_perask_lines 
-      reask_block += "\nResult of ASK: #{tool} #{params.join("")} was above #{max_perask_lines} lines (#{result_lines}), please ask more specifically and/or better.\n"
+      reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nOver budget, wanted #{result_lines} lines, only #{max_perask_lines} available\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
     else
       valid_lines += result_lines
       ask_block += result
       reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\n" + result + "\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
     end
-    puts
   end
   ask_block
 end
