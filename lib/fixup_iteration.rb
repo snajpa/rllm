@@ -1,63 +1,5 @@
-def apply_suggested_changes(repo, file, line_number, solution)
-  # Get current file content
-  full_path = File.join(repo.workdir, file)
-  return false unless File.exist?(full_path)
-  
-  file_array = File.read(full_path).split("\n")
-  solution_array = solution.split("\n")
-  solution_hash = {}
-  
-  # Parse numbered solution lines
-  solution_array.each do |line|
-    if line =~ /^(\s{0,5}\d{1,6}) (.*)$/
-      solution_hash[$1.to_i-1] = $2
-    end
-  end
-  
-  return false if solution_hash.empty?
-  
-  # Find solution boundaries
-  solution_start = solution_hash.keys.min 
-  solution_end = solution_hash.keys.max
-  
-  # Validate line numbers match
-  return false if solution_start != line_number
-  
-  # Create new content 
-  new_content = []
-  
-  # Keep content before change
-  file_array.each_with_index do |line, index|
-    break if index >= solution_start
-    new_content << line
-  end
-  
-  # Insert solution
-  solution_hash.each do |line_number, line|
-    new_content << line
-  end
-  
-  # Keep remaining content
-  file_array.each_with_index do |line, index|
-    next if index <= solution_end
-    new_content << line
-  end
-  
-  # Write updated file
-  temp_path = "#{full_path}.tmp"
-  begin
-    File.open(temp_path, 'w') { |f| f.write(new_content.join("\n")) }
-    FileUtils.mv(temp_path, full_path)
-    return true
-  rescue => e
-    FileUtils.rm(temp_path) if File.exist?(temp_path)
-    puts "Error applying changes: #{e}"
-    return false
-  end
-end
-
-def fixup_iteration(llmc, temperature, repo, build_output, reask_llmc, reask_perask_lines, reask_valid_lines, reask_iter_limit)
-  # 1) Strip ANSI codes, parse errors
+def fixup_iteration(llmc, temperature, repo, build_output, last_patch_str, reask_llmc, reask_perask_lines, reask_valid_lines, reask_iter_limit)
+  # Strip ANSI codes, parse errors (keep existing code)
   ansi_regex = /\x1b(?:[@-Z\\-_]|\[[0-?]*[ -\/]*[@-~]|\][^@\x07]*[@\x07]|\x7f)/
   error_lines = build_output.split("\n").map { |l| l.gsub(ansi_regex, "") }
   parsed_error_lines = []
@@ -82,99 +24,331 @@ def fixup_iteration(llmc, temperature, repo, build_output, reask_llmc, reask_per
   end
   return true if parsed_error_lines.empty?
 
-  # 2) Gather around-error context
-  error_files_context = {}
-  error_files.uniq.each do |file|
-    file_path = File.join(repo.workdir, file)
-    next unless File.exist?(file_path)
-    lines_arr = File.read(file_path).split("\n")
-    relevant = parsed_error_lines.select { |err| err[:file] == file }
-    error_context_around = 8
-
-    relevant.each do |err|
-      start_line = [0, err[:line] - error_context_around - 1].max
-      end_line   = [lines_arr.size - 1, err[:line] + error_context_around - 1].min
-      slice = lines_arr[start_line..end_line]
-      (start_line..end_line).each_with_index do |lineno, idx|
-        error_files_context[file] ||= {}
-        error_files_context[file][lineno] = slice[idx]
-      end
+  last_patch_str_numbered = ""
+  if !last_patch_str.empty?
+    
+    max_lineno_length = last_patch_str.split("\n").size.to_s.size
+    last_patch_str.split("\n").each_with_index do |line, index|
+      last_patch_str_numbered += "%#{max_lineno_length}d %s\n" % [index + 1, line]
     end
-    error_files_context[file] = error_files_context[file].sort.to_h
   end
 
-  # 3) For each error line, blame + gather context like in merge_iteration
-  error_files_context.each do |file, lines_h|
-    lines_h.each do |lineno, content|
-      blame = []
-      begin
-        blame = repo.blame(file, new_start_line: lineno + 1, new_end_line: lineno + 1)
-      rescue => e
-        puts "Blame error #{e}"
-      end
+  initial_prompt = ""
+  # First pass - let LLM gather context about errors
+  initial_prompt += <<~PROMPT
+  You are tasked to fix build errors after a failed merge attempt.
 
-      culprit_commit = blame[0][:orig_commit] rescue nil
-      culprit_subject = culprit_commit ? culprit_commit.message.to_s.split("\n").first : "<no commit>"
-      puts "\nFile: #{file}, line #{lineno + 1}, introduced by commit: #{culprit_subject}"
+  Given these build errors and warnings:
 
-      ask_block = ask_and_gather_context(
-        repo,
-        reask_llmc,
-        temperature,
-        "", # prompt_common
-        file,
-        reask_perask_lines,
-        reask_valid_lines,
-        reask_iter_limit
+  #{parsed_error_lines.map { |e| "#{e[:file]}:#{e[:line]}:#{e[:column]}: #{e[:message]}" }.join("\n")}
+
+  You can ask for more context before deciding what to edit.
+  PROMPT
+
+  if !last_patch_str_numbered.empty?
+    initial_prompt += <<~PROMPT
+  
+    This is a next iteration of the fixup process on top of new merge results.
+
+    During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
+    
+    ```
+    #{last_patch_str_numbered}
+    ```  
+    PROMPT
+  end
+  initial_prompt += <<~PROMPT
+
+  Examine the errors and ask for any additional context you need.
+  
+  PROMPT
+
+  # Get context using existing function
+  ask_block = ask_and_gather_context(
+    repo,
+    reask_llmc, 
+    temperature,
+    initial_prompt,
+    reask_perask_lines,
+    reask_valid_lines,
+    reask_iter_limit
+  )
+
+  # Second pass - get edit locations with context
+  edit_location_prompt = <<~PROMPT
+  You are tasked to fix build errors after a failed merge attempt.
+
+  Given these build errors and context:
+
+  Errors:
+  #{parsed_error_lines.map { |e| "#{e[:file]}:#{e[:line]}:#{e[:column]}: #{e[:message]}" }.join("\n")}
+
+  Context gathered:
+  #{ask_block}
+
+  PROMPT
+
+  if !last_patch_str_numbered.empty?
+    edit_location_prompt += <<~PROMPT
+  
+    This is a next iteration of the fixup process on top of new merge results.
+
+    During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
+    
+    ```
+    #{last_patch_str_numbered}
+    ```  
+    PROMPT
+  end
+
+  edit_location_prompt += <<~PROMPT
+  
+  Please specify which files and line ranges you need to edit to fix these issues.
+  
+  Valid format examples:
+  
+  Example 1:
+
+  EDIT: relative_path_to_file:start_line-end_line # rationale for edit
+
+  Example 2:
+
+  EDIT: relative_path_to_file:start_line # rationale for edit
+
+  Thus, the format is strictly following the pattern:
+
+  EDIT: relative_path_to_file:start_line[-end_line] # rationale for edit
+
+  You can only specify one range per file. If you need to edit multiple ranges in the same file, please specify them separately.
+
+  Which files and line ranges do you need to edit?
+
+  Your response:
+
+  PROMPT
+
+  edit_locations = []
+  while edit_locations.empty?
+    # Get edit locations
+    edit_locations = []
+    response = ""
+    catch(:close) do
+      llmc.completions(
+        parameters: {
+          temperature: temperature,
+          prompt: edit_location_prompt,
+          max_tokens: 512,
+          stream: proc do |chunk, _bytesize|
+            response += chunk["choices"].first["text"]
+            print chunk["choices"].first["text"]
+          end
+        }
       )
+    end
 
-      # Prepare LLM prompt with blame + user context
-      prompt = <<~PROMPT
-        We have an issue at #{file}:#{lineno + 1}, introduced by:
-        Commit subject: #{culprit_subject}
-
-        Additional context requested:
-        #{ask_block}
-
-        Please propose a fix referencing line #{lineno + 1}.
-      PROMPT
-
-      response = ""
-      catch(:close) do
-        llmc.completions(
-          parameters: {
-            temperature: temperature,
-            prompt: prompt,
-            max_tokens: 512,
-            stream: proc do |chunk, _bytesize|
-              response += chunk["choices"].first["text"]
-              print chunk["choices"].first["text"]
-              
-              if response.include?("```") && response.split("```").size >= 2
-                throw :close
-              end
-            end
+    response.split("\n").each do |line|
+      # Match EDIT: relative_path_to_file:start_line-end_line # rationale for edit
+      # or EDIT: relative_path_to_file:start_line # rationale for edit
+      if line =~ /^EDIT\**:\s*([^:]+):(\d+(?:-\d+)?)\s*#\s*(.*)$/
+        file = $1.strip
+        range = $2.strip
+        rationale = $3.strip
+        
+        if range =~ /(\d+)-(\d+)/
+          edit_locations << {
+            file: file,
+            start_line: $1.to_i - 1,
+            end_line: $2.to_i - 1,
+            rationale: rationale
           }
-        )
+        else
+          # Single line edit
+          line_num = range.to_i
+          edit_locations << {
+            file: file,
+            start_line: line_num - 1,
+            end_line: line_num - 1,
+            rationale: rationale
+          }
+        end
+        puts "Found edit location: #{file}:#{range} # #{rationale}"
+      end
+    end
+  end
+
+  # Process each edit location
+  edit_locations.each do |location|
+    file = location[:file]
+    file_path = File.join(repo.workdir, file)
+    next unless File.exist?(file_path)
+
+    puts "Processing edit for #{file} lines #{location[:start_line] + 1}-#{location[:end_line] + 1}"
+
+    # Get context like in merge_iteration
+    ask_block = ask_and_gather_context(
+      repo,
+      reask_llmc,
+      temperature,
+      file,
+      reask_perask_lines,
+      reask_valid_lines,
+      reask_iter_limit
+    )
+
+    # Get file content and prepare context block
+    file_content = File.read(file_path).split("\n")
+    context_around = 25
+    start_line = [0, location[:start_line] - context_around].max
+    end_line = [file_content.size - 1, location[:end_line] + context_around].min
+    
+    context_block = ""
+    (start_line..end_line).each do |i|
+      context_block += "%d %s\n" % [i + 1, file_content[i]]
+    end
+
+    edit_prompt = <<~PROMPT
+    We need to edit #{file} lines #{location[:start_line] + 1}-#{location[:end_line] + 1}.
+    The rationale for this edit is: #{location[:rationale]}.
+
+    Additional context gathered:
+    #{ask_block}
+    PROMPT
+
+    if !last_patch_str_numbered.empty?
+      edit_prompt += <<~PROMPT
+    
+      This is a next iteration of the fixup process on top of new merge results.
+
+      During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
+      
+      ```
+      #{last_patch_str_numbered}
+      ```  
+      PROMPT
+    end
+
+    edit_location_prompt += <<~PROMPT
+
+    Here is the current code block with line numbers:
+    ```
+    #{context_block}
+    ```
+
+    Please provide the edited version of this code block.
+    IMPORTANT: Your response must:
+    1. Start with "```"
+    2. Be complete integrated version of the edited code block
+    3. Preserve line numbers exactly as shown
+    4. End with "```
+
+    Example format:
+    ```
+    123 def method
+    124   fixed_code_here
+    125 end
+    ```
+
+    Your response:
+    PROMPT
+
+    # Get and apply edit suggestion using existing numbered line merge logic
+    response = ""
+    catch(:close) do
+      llmc.completions(
+        parameters: {
+          temperature: temperature,
+          prompt: edit_prompt,
+          max_tokens: 512,
+          stream: proc do |chunk, _bytesize|
+            response += chunk["choices"].first["text"]
+            print chunk["choices"].first["text"]
+            
+            if response.include?("```") && response.split("```").size >= 3
+              throw :close
+            end
+          end
+        }
+      )
+    end
+
+    # Extract code block from response 
+    blocks = response.split("\n").reverse
+    solution = ""
+    in_block = false
+    solution_numbered_hash = {}
+
+    blocks.each do |line|
+      if line.start_with?("```")
+        in_block = !in_block
+      elsif in_block
+        # Parse numbered lines (e.g. "  123 code")
+        if line =~ /^(\s{0,5}\d{1,6}) (.*)$/
+          solution_numbered_hash[$1.to_i-1] = $2
+        else
+          solution += line + "\n"
+        end
+      end
+    end
+
+    if !solution_numbered_hash.empty?
+      solution_start = solution_numbered_hash.keys.min
+      solution_end = solution_numbered_hash.keys.max
+
+      # Validate line numbers
+      error = false
+      solution_end.downto(solution_start) do |line_number|
+        if !solution_numbered_hash.has_key?(line_number)
+          puts "Missing line #{line_number}"
+          error = true
+        end
+      end
+      
+      if error
+        puts "Failed - solution has missing line numbers"
+        next
       end
 
-      # Extract code block from response
-      blocks = response.split("\n").reverse
-      solution = ""
-      in_block = false
-      blocks.each do |line|
-        if line.start_with?("```")
-          in_block = !in_block
-        elsif in_block
-          solution = line + "\n" + solution
+      # Read current file content
+      file_path = File.join(repo.workdir, file)
+      file_content = File.read(file_path).split("\n")
+
+      # Generate new content
+      new_content = []
+      
+      # Add lines before fix
+      file_content.each_with_index do |line, index|
+        if index >= solution_end
+          break
+        end
+        if index < solution_start 
+          new_content << line
         end
       end
 
-      if solution && apply_suggested_changes(repo, file, lineno, solution)
-        puts "Successfully applied changes to #{file}"
-      else
-        puts "Failed to apply changes to #{file}"
+      # Add fixed lines
+      solution_numbered_hash.each do |line_number, line|
+        new_content << line
       end
+
+      # Add remaining lines
+      file_content.each_with_index do |line, index|
+        if index > solution_end
+          new_content << line
+        end
+      end
+
+      begin
+        File.open(file_path, 'w') { |f| f.write(new_content.join("\n")) }
+        puts "Successfully applied changes to #{file}"
+        true
+      rescue => e
+        puts "Failed to apply changes to #{file}: #{e.message}"
+        puts e.backtrace
+        false
+      end
+    else
+      puts "Failed - no valid numbered lines found in solution"
+      false
     end
   end
 

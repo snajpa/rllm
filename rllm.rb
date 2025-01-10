@@ -14,6 +14,9 @@ require 'net/ssh'
 
 require_relative './lib/merge_iteration'
 require_relative './lib/fixup_iteration'
+require_relative './lib/ask_and_gather_context'
+require_relative './lib/run_ssh_commands'
+require_relative './lib/utils'
 
 # Configuration
 # cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_F16=true -DGGML_CUDA_PEER_MAX_BATCH_SIZE=256 -DGGML_CUDA_FA_ALL_QUANTS=true
@@ -27,10 +30,10 @@ LOG_FILE = 'rllm.log'
 options = {}
 
 repo_dir = '/home/snajpa/linux'
-#src_commit = '0bc21e701a6f' # os-wip
-#cherrypick_commit_range = 'ed9ef699255e..0ed74379442a' # os-wip
-src_commit = '0bc21e701a6f' # 6.13-rc5+
-cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e'
+src_commit = '0bc21e701a6f' # random linux commit
+cherrypick_commit_range = 'd3e69f8ab5df..c09b3eaeafd9' # syslog-ns
+#src_commit = '0bc21e701a6f' # 6.13-rc5+
+#cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e'
 #src_commit = '8155b4ef3466' # next-20240104
 #cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68' # from 6.12.7
 dst_branch_name = 'vpsadminos-devel'
@@ -61,67 +64,6 @@ commit_list = walker.map(&:oid).reverse
 def force_push(repo_dir, dst_remote_name, dst_branch_name)
   `cd #{repo_dir} && git push -f #{dst_remote_name} #{dst_branch_name}`
   $?
-end
-# take optional block of code to run on incoming lines
-def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
-  begin
-    puts "Connecting to #{ssh_host} as #{ssh_user}" unless quiet
-    Net::SSH.start(ssh_host, ssh_user, ssh_options) do |ssh|
-      commands.each do |command|
-        puts "Executing: #{command[:cmd]}" unless quiet
-        command[:output_lines] = []
-        command[:exit_status] = nil
-        ch = ssh.open_channel do |ch|
-          ch.request_pty do |ch, success|
-            raise "Failed to get PTY" unless success
-
-            ch.exec(command[:cmd]) do |ch, success|
-              raise "Failed to execute command" unless success
-
-              ch.on_data do |_, data|
-                data.split("\n").each do |line|
-                  puts line unless quiet
-                  command[:output_lines] << line
-                  block.call(ch, command, line) if block
-                end
-              end
-
-              ch.on_extended_data do |_, _, data|
-                data.split("\n").each do |line|
-                  unless quiet
-                    puts line unless quiet
-                  end
-                  command[:output_lines] << line
-                  block.call(ch, command, line) if block
-                end
-              end
-
-              ch.on_request("exit-status") do |_, data|
-                command[:exit_status] = data.read_long
-                unless quiet
-                  tty_width = `tput cols`.to_i
-                  print "Exit status: #{command[:exit_status]}" + " " * (tty_width - 15) + "\n"
-                  puts
-                end
-                if command[:exit_status] != 0 && !command[:can_fail]
-                  ch.close
-                  raise
-                end
-              end
-            end
-          end
-        end
-        ch.wait
-      end
-    end
- # rescue Interrupt
- #   return { failed: true, results: commands }
-  rescue => e
-    puts e.message
-    puts e.backtrace unless quiet
-    return { failed: true, results: commands }
-  end
-  { failed: false, results: commands }
 end
 
 def ssh_build_iteration(ssh_host, ssh_user, ssh_options, quiet, dst_remote_name, dst_branch_name, dir, cores, &block)
@@ -174,6 +116,7 @@ ssh_options = {
   verify_host_key: :never
 }
 error_context = ""
+fixup_patch_str = ""
 compiled_ok = false
 max_iterations = 10
 iter = 0
@@ -182,7 +125,7 @@ begin
     iter += 1
     prev_results = merge_iteration(llmc, 0.8, repo,
                                    src_commit, commit_list, dst_branch_name,
-                                   llmc_fast, 256, 512, 18*iter, error_context, prev_results)
+                                   llmc_fast, 768, 2048, 24*iter, error_context, prev_results)
     puts "Saving merge results"
     f = File.open('merge_results.bin', 'w')
     f.write(Marshal.dump(prev_results))
@@ -196,37 +139,80 @@ begin
     end
     exit 1 unless pushed
 
-    b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
-                            dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
-    #do |ch, command, line|
-    #  if line =~ /error:/i
-    #    puts "Error detected, closing connection"
-    #    command[:exit_status] = 1
-    #    ch.close
-    #    raise
-    #  end
-    #end
-    error_context = extract_error_context(b)
-    puts "Compiled OK: #{compiled_ok}"
+    max_fixup_iterations = 10
+    fixup_ok = false
+    fixup_iter = 0
+    while !compiled_ok && fixup_iter < max_fixup_iterations
+      fixup_iter += 1
+      b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
+                              dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
+      #do |ch, command, line|
+      #  if line =~ /error:/i
+      #    puts "Error detected, closing connection"
+      #    command[:exit_status] = 1
+      #    ch.close
+      #    raise
+      #  end
+      #end
+      error_context = extract_error_context(b)
 
-    build_second = false
-    if !compiled_ok && error_context.length > 0
-      fixup_ok = fixup_iteration(llmc, 0.3, repo, error_context,
-                                 llmc_fast, 200, 600, 32)
+      compiled_ok = b[:results].last[:exit_status] == 0
+      puts "Compiled OK: #{compiled_ok}"
+
+      if !compiled_ok && error_context.length > 0
+        puts "\nRunning fixup iteration #{fixup_iter}/#{max_fixup_iterations}\n\n"
+        fixup_ok = fixup_iteration(llmc, 0.3, repo, error_context, fixup_patch_str,
+                                  llmc_fast, 768, 2048, 48)
+        if fixup_ok
+          puts "Fixup OK, retrying build"
+        else
+          puts "Fixup failed, continuing with next merge iteration"
+        end
+      end
+
+      # We should now commit the fixup changes and feed them back to the merge iteration
+      
       if fixup_ok
-        puts "Fixup OK, retrying build"
-        build_second = true
-      else
-        puts "Fixup failed, continuing with next merge iteration"
+        # Commit all changes using Rugged
+        tree_before = repo.head.target.tree
+        index = repo.index
+        index.add_all
+        index.write
+        commit_oid = Rugged::Commit.create(repo, {
+          tree: index.write_tree(repo),
+          author: { email: "snajpa@snajpa.net", name: "Pavel Snajdr (via rllm)", time: Time.now },
+          committer: { email: "snajpa@snajpa.net", name: "Pavel Snajdr (via rllm)", time: Time.now },
+          message: "Fixup iteration #{fixup_iter}",
+          parents: [repo.head.target]
+        })
+        repo.references.update("HEAD", commit_oid)
+        puts "Committed fixup changes"
+
+        diff = tree_before.diff(repo.lookup(commit_oid).tree)
+
+        # Output like git show, commit message first, then diff
+        puts "commit #{commit_oid}"
+        puts "Author: #{repo.lookup(commit_oid).author[:name]} <#{repo.lookup(commit_oid).author[:email]}>"
+        puts "Date:   #{repo.lookup(commit_oid).author[:time]}"
+        puts
+        repo.lookup(commit_oid).message.each_line do |line|
+          puts "    #{line}"
+        end
+        puts
+        puts diff.patch
+
+        fixup_patch_str = ""
+        fixup_patch_str += "commit #{commit_oid}\n"
+        fixup_patch_str += "Author: #{repo.lookup(commit_oid).author[:name]} <#{repo.lookup(commit_oid).author[:email]}>\n"
+        fixup_patch_str += "Date:   #{repo.lookup(commit_oid).author[:time]}\n"
+        fixup_patch_str += "\n"
+        repo.lookup(commit_oid).message.each_line do |line|
+          fixup_patch_str += "    #{line}"
+        end
+        fixup_patch_str += "\n"
+        fixup_patch_str += diff.patch
       end
     end
-
-    next unless build_second
-
-    b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
-                            dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
-    error_context = extract_error_context(b)
-    puts "Compiled OK: #{compiled_ok}"
   end
 rescue Interrupt => e
   puts "Merge iteration interrupted: #{e.message}"
