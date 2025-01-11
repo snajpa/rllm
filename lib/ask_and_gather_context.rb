@@ -4,7 +4,6 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
   reask_block = ""
   ask_block = ""
   asks = []
-  puts "Gathering additional context"
   while valid_lines < max_valid_lines
     iters += 1
     if iters > reask_iter_limit
@@ -53,6 +52,8 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
 
     PROMPT
 
+    warmup_kv_cache_common_prompt(llmc, prompt_common + prompt_reask)
+    
     if ask_block.empty?
       prompt_reask += <<~PROMPT
       
@@ -67,7 +68,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
       1 hello world
       ```
       
-      LINES_BUDGET_LEFT: 10
+      BUDGET_LEFT: 10 lines and 3 asks
       
       ASK: close
       RESULT:
@@ -82,21 +83,26 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
       prompt_reask += <<~PROMPT
       
       ---------------------
-      Your previous asks:
-      
+      Your previous asks with their results:
       #{reask_block}
+      ---------------------
+
       
       ---------------------
+      Simple list of at least correctly parsed asks:
+      #{asks.map { |tool, params_str| "ASK: #{tool} #{params_str}" }.join("\n")}
+      ---------------------
+      
 
       PROMPT
     end
     prompt_reask += <<~PROMPT
 
-    LINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}
+    BUDGET_LEFT: #{max_valid_lines - valid_lines}
 
     Please respond in the format ASK: <tool> <parameter1> [<parameter2> ...] to ask for more context.
 
-    Pick the most relevant tool to ask for the context you need to resolve the task at hand.
+    Pick the most relevant tool to ask for the context you need to resolve the task at hand, or close the context gathering if you have enough context using ASK: close.
   
     ---------------------
     Next ask:
@@ -139,7 +145,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
     tool, params_str = ask_match.captures
     params_str ||= ""
     params = []
-    params_str.split(/\s(?=(?:[^"]|"[^"]*")*$)/).each do |param|
+    params_str.split(/\s+(?=(?:[^"]|"[^"]*")*$)/).each do |param|
       if param.start_with?('"') && param.end_with?('"')
         params << param[1..-2]
       else
@@ -151,8 +157,8 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
 
     # If duplicate ask
     if asks.include?([tool, params_str])
-      puts ": Duplicate ask"
-      reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nDuplicate ask\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+      puts ": Dupla"
+      reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Duplicate ask, you need to think harder than this.\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
       next
     end
     asks << [tool, params_str]
@@ -163,24 +169,40 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
       files = []
       pattern = params[0]
       params[1..-1].each do |param|
-        next if param.strip.empty?
+        if param.strip.empty?
+          pattern = ""
+          break
+        end
         param = param[1..-1] if param.start_with?("/")
         if File.exist?(File.join(repo.workdir, param))
           files << param
-        elsif globbed_files = Dir.glob(File.join(repo.workdir, param)).select { |file| File.file?(file) }
+        elsif !Dir.glob(File.join(repo.workdir, param)).select { |file| File.directory?(file) }.empty?
+          globbed_files = Dir.glob(File.join(repo.workdir, param))
+          if globbed_files.empty?
+            print ": Invalid file or glob pattern, eh.: #{param}"
+            reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: File or glob pattern not found: #{param}\n"
+            pattern = ""            
+            break
+          end
           globbed_files.each do |file|
             relative_path = Pathname.new(file).relative_path_from(Pathname.new(repo.workdir)).to_s
-            files << relative_path
+            if File.exist?(File.join(repo.workdir, relative_path))
+              puts "\n: Adding globbed path: #{relative_path}"
+              files << relative_path
+            else
+              puts "\n: Invalid file or glob pattern - SHOULD NOT GET HERE EVER: #{relative_path}"
+            end
           end
         else
-          puts ": Invalid file or glob pattern: #{param}"
-          #reask_block += "\ASK: #{tool} #{params.join(" ")}\nRESULT:\nInvalid ask, file or glob pattern not found: #{param}\n"
-          next
+          print ": Not file or glob: #{param}"
+          reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: File or glob pattern not found: #{param}\n"
+          pattern = ""
+          break
         end
       end
       if files.size > max_valid_lines
         puts ": Over budget (wanted #{files.size} lines, but only #{max_valid_lines - valid_lines} available)"
-        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nOver budget with the glob path, wanted #{files.size} lines, but only #{max_valid_lines - valid_lines} available.\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Output too large. Would go over budget with such glob path, wanted #{files.size} lines, but only #{max_valid_lines - valid_lines} available.\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
         next
       end
       if files.empty?
@@ -188,15 +210,15 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
       end
       if pattern.strip.empty?
         puts ": Invalid ask"
-        #reask_block += "\ASK: #{tool} #{params.join(" ")}\nRESULT:\nInvalid ask, syntax is ASK: grep-context-n <pattern> <file1> [<file2> ...]\n"
+        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR:Invalid ask\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
         next
       end
       params = [pattern] + files
       cmd = "cd #{repo.workdir} && git grep --no-color -n \"#{pattern}\" -- #{files.join(" ")}"
       git_grep_result = `#{cmd}`
       if git_grep_result.size > (max_valid_lines - valid_lines)
-        puts ": Over budget (git grep has #{git_grep_result.size} lines, but only #{max_valid_lines - valid_lines} available)"
-        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nOver budget, wanted #{git_grep_result.size} lines, but only #{max_valid_lines - valid_lines} available.\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+        puts ": Over budget (git grep has #{git_grep_result.size} lines, but only #{max_valid_lines - valid_lines} lines available at all)"
+        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Output too large, would go over budget, wanted #{git_grep_result.size} lines, but only #{max_valid_lines - valid_lines} available.\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
         next
       end
       filelines = {}
@@ -215,7 +237,8 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
         #puts "Pattern: #{pattern}"
         #puts "Result: #{git_grep_result}"
         #puts "Command: #{cmd}"
-        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nNo matches found for pattern: #{pattern} in files: #{files.join(" ")}\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nNothing found for pattern: \"#{pattern}\" in any of files! (files: #{files.join(" ")})\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
+        ask_block += "\nNo match for pattern: \"#{pattern}\" in any of checked files - files checked: #{files.join(" ")})."
         next
       end
       filelines.each do |file, linenumbers|
@@ -230,33 +253,30 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
       begin
         line_number = params[0].to_i
         params[1..-1].each do |param|
-          if param.strip.empty?
-            file = "."
-            break
-          end
           file = param
           break if File.exist?(File.join(repo.workdir, file))
         end
       rescue
         puts ": Invalid ask"
-        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nInvalid ask, syntax is ASK: cat-context <line_number> <relative_path>\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Invalid ask, syntax is ASK: cat-context <line_number> <relative_path>\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
         next
       end
       if file.empty?
         puts ": Path not given"
-        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nPath not given\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Path not given\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
         next
       end
       # if doesn't exist or is not a file
       if !File.exist?(File.join(repo.workdir, file)) || !File.file?(File.join(repo.workdir, file))
         puts ": File not found or is a directory"
-        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nFile not found or is a directory: #{file}\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: File not found or is a directory: #{file}\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
         next
       end
       context = get_file_context(repo, file, [line_number], 40)
       if context.empty?
+        line_count = File.read(File.join(repo.workdir, file)).split("\n").size
         puts ": Line not found"
-        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nLine not found: #{line_number}\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Line not found: #{line_number}, the file only has #{line_count} lines\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
         next
       end
       result = "\n#{file}:\n"
@@ -268,12 +288,12 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
         file = params[1]
         if file.nil?
           puts ": Path not given"
-          reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nPath not given\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+          reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Path not given\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
           next
         end
         if !File.exist?(File.join(repo.workdir, file))
           puts ": File not found"
-          reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nFile not found: #{file}\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+          reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: File not found: #{file}\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
           next
         end
         result = `cd #{repo.workdir} && git blame -L #{line_number},#{line_number} -- #{Shellwords.escape(file)} 2>&1`
@@ -283,7 +303,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
       end
       if result.empty?
         puts ": No blame found"
-        reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nNo blame found for line: #{line_number} in file: #{file}\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: No blame found for line: #{line_number} in file: #{file}\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
         next
       end
       result = "\n```\n#{result}```\n"
@@ -294,11 +314,11 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
     end
     result_lines = result.split("\n").size
     if result_lines > max_perask_lines 
-      reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\nOver budget, wanted #{result_lines} lines, but only #{max_perask_lines} available\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+      reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Over budget, wanted #{result_lines} lines, but only #{max_perask_lines} available\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
     else
       valid_lines += result_lines
       ask_block += result
-      reask_block += "\nASK: #{tool} #{params.join(" ")}\nRESULT:\n" + result + "\nLINES_BUDGET_LEFT: #{max_valid_lines - valid_lines}\n"
+      reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\n" + result + "\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
     end
   end
   ask_block

@@ -8,6 +8,7 @@ require 'net/http'
 require 'json'
 require 'fileutils'
 require 'pathname'
+require 'digest'
 
 require 'openai'
 require 'net/ssh'
@@ -20,8 +21,10 @@ require_relative './lib/utils'
 
 # Configuration
 # cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_F16=true -DGGML_CUDA_PEER_MAX_BATCH_SIZE=256 -DGGML_CUDA_FA_ALL_QUANTS=true
-# CUDA_VISIBLE_DEVICES="1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/granite-3.1-8b-instruct.Q8_0.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8080 -fa -ctk q4_0 -ctv q4_0
-# CUDA_VISIBLE_DEVICES="0,1,2" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8081 -fa -ctk q4_0 -ctv q4_0 -ts 20,5,20 -mg 1 -ub 512 -b 4096
+# CUDA_VISIBLE_DEVICES="1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/granite-3.1-8b-instruct.Q8_0.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8080 -fa -ctk q4_0 -ctv q4_0 --slot-save-path ~/tmp/llama-cache/
+# CUDA_VISIBLE_DEVICES="0,1,2" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8081 -fa -ctk q4_0 -ctv q4_0 -ts 20,5,20 -mg 1 -ub 512 -b 4096 --slot-save-path ~/tmp/llama-cache/
+
+$caching_enabled = true
 
 LLAMA_API_ENDPOINT_GOOD_SLOW = 'http://localhost:8081'
 LLAMA_API_ENDPOINT_MEH_FAST = 'http://localhost:8080'
@@ -30,12 +33,22 @@ LOG_FILE = 'rllm.log'
 options = {}
 
 repo_dir = '/home/snajpa/linux'
-src_commit = '0bc21e701a6f' # random linux commit
+
+src_sha = ""
+cherrypick_commit_range = ""
+if false
+src_sha = '0bc21e701a6f' # random linux commit
 cherrypick_commit_range = 'd3e69f8ab5df..c09b3eaeafd9' # syslog-ns
-#src_commit = '0bc21e701a6f' # 6.13-rc5+
-#cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e'
-#src_commit = '8155b4ef3466' # next-20240104
-#cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68' # from 6.12.7
+end
+if true
+  src_sha = '0bc21e701a6f' # 6.13-rc5+
+  cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e'
+end
+if false
+  src_sha = '8155b4ef3466' # next-20240104
+  cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68' # from 6.12.7
+end
+
 dst_branch_name = 'vpsadminos-devel'
 dst_remote_name = 'origin'
 
@@ -73,13 +86,14 @@ def ssh_build_iteration(ssh_host, ssh_user, ssh_options, quiet, dst_remote_name,
     { cmd: "cd #{dir}; git branch -D #{dst_branch_name}", can_fail: true },
     { cmd: "cd #{dir}; git reset --hard #{dst_remote_name}/#{dst_branch_name}", can_fail: true },
     { cmd: "cd #{dir}; git checkout --progress -b #{dst_branch_name} #{dst_remote_name}/#{dst_branch_name}", can_fail: false },
+    { cmd: "cd #{dir}; cp ~/okconfig ~/linux-rllm/.config", can_fail: false },
     { cmd: "cd #{dir}; make -j #{cores}", can_fail: true }
   ]
   run_ssh_commands("172.16.106.12", "root", ssh_options, quiet, commands, &block)
 end
 
 puts "Starting merge process"
-puts "Source commit: #{src_commit}"
+puts "Source commit: #{src_sha}"
 puts "Cherrypick commit range: #{cherrypick_commit_range}"
 puts "Destination branch: #{dst_branch_name}"
 puts "Destination remote: #{dst_remote_name}"
@@ -115,109 +129,98 @@ ssh_options = {
   config: true,
   verify_host_key: :never
 }
-error_context = ""
-fixup_patch_str = ""
-compiled_ok = false
-max_iterations = 10
-iter = 0
-begin
-  while !compiled_ok && iter < max_iterations
-    iter += 1
-    prev_results = merge_iteration(llmc, 0.8, repo,
-                                   src_commit, commit_list, dst_branch_name,
-                                   llmc_fast, 768, 2048, 24*iter, error_context, prev_results)
-    puts "Saving merge results"
-    f = File.open('merge_results.bin', 'w')
-    f.write(Marshal.dump(prev_results))
-    f.close
 
-    pushed = false
-    3.times do
-      f = force_push(repo_dir, dst_remote_name, dst_branch_name)
-      pushed = f.exitstatus == 0
-      break if pushed
-    end
-    exit 1 unless pushed
-
-    max_fixup_iterations = 10
-    fixup_ok = false
-    fixup_iter = 0
-    while !compiled_ok && fixup_iter < max_fixup_iterations
-      fixup_iter += 1
-      b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
-                              dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
-      #do |ch, command, line|
-      #  if line =~ /error:/i
-      #    puts "Error detected, closing connection"
-      #    command[:exit_status] = 1
-      #    ch.close
-      #    raise
-      #  end
-      #end
-      error_context = extract_error_context(b)
-
-      compiled_ok = b[:results].last[:exit_status] == 0
-      puts "Compiled OK: #{compiled_ok}"
-
-      if !compiled_ok && error_context.length > 0
-        puts "\nRunning fixup iteration #{fixup_iter}/#{max_fixup_iterations}\n\n"
-        fixup_ok = fixup_iteration(llmc, 0.3, repo, error_context, fixup_patch_str,
-                                  llmc_fast, 768, 2048, 48)
-        if fixup_ok
-          puts "Fixup OK, retrying build"
-        else
-          puts "Fixup failed, continuing with next merge iteration"
-        end
-      end
-
-      # We should now commit the fixup changes and feed them back to the merge iteration
+def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, repo, src_sha, commit_list, dst_branch_name)
+  results = {}
+  src_commit = repo.lookup(src_sha)
+  
+  # Setup initial branch state
+  repo.reset(src_commit.oid, :hard)
+  repo.checkout(src_commit.oid)
+  begin
+    repo.branches.delete(dst_branch_name)
+  rescue Rugged::ReferenceError
+  end
+  repo.branches.create(dst_branch_name, src_commit.oid)
+  repo.checkout("refs/heads/#{dst_branch_name}")
+  reset_target = src_commit.oid
+  
+  n_commits = commit_list.size
+  commit_list.each_with_index do |sha, index|
+    commit = repo.lookup(sha)
+    n_commit = commit_list.index(sha) + 1
+    
+    merge_ok = false
+    build_ok = false
+    error_context = ""
+    max_iterations = 10
+    iter = 0
+    
+    while !build_ok && iter < max_iterations
+      iter += 1
       
-      if fixup_ok
-        # Commit all changes using Rugged
-        tree_before = repo.head.target.tree
-        index = repo.index
-        index.add_all
-        index.write
-        commit_oid = Rugged::Commit.create(repo, {
-          tree: index.write_tree(repo),
-          author: { email: "snajpa@snajpa.net", name: "Pavel Snajdr (via rllm)", time: Time.now },
-          committer: { email: "snajpa@snajpa.net", name: "Pavel Snajdr (via rllm)", time: Time.now },
-          message: "Fixup iteration #{fixup_iter}",
-          parents: [repo.head.target]
-        })
-        repo.references.update("HEAD", commit_oid)
-        puts "Committed fixup changes"
+      puts "\n#{iter}/#{max_iterations} iters: Processing commit #{n_commit}/#{n_commits}: #{sha[0..7]} - #{commit.message.split("\n").first}"
 
-        diff = tree_before.diff(repo.lookup(commit_oid).tree)
+      # Try merge iteration
+      result = merge_iteration(llmc, 0.8, repo, reset_target, dst_branch_name, src_sha, sha, llmc_fast,
+                               768, 2048, 2*iter, results[sha], error_context)
+      results[sha] = result if result[:resolved]
+      #reset_target = result[:reset_target]
 
-        # Output like git show, commit message first, then diff
-        puts "commit #{commit_oid}"
-        puts "Author: #{repo.lookup(commit_oid).author[:name]} <#{repo.lookup(commit_oid).author[:email]}>"
-        puts "Date:   #{repo.lookup(commit_oid).author[:time]}"
-        puts
-        repo.lookup(commit_oid).message.each_line do |line|
-          puts "    #{line}"
+      # Only do this if we're doing the last commit
+      unless n_commit == n_commits
+        puts "Skipping build for non-last commit"
+        build_ok = true
+        next
+      end
+      
+      # Try push
+      pushed = false
+      3.times do
+        f = force_push(repo.workdir, dst_remote_name, dst_branch_name)
+        pushed = f.exitstatus == 0
+        break if pushed
+      end
+      next unless pushed
+      
+      5.times do |fixup_iter|
+        # Try build
+        b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
+                              dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
+        build_ok = b[:results].last[:exit_status] == 0
+        
+        if !build_ok
+          error_context = extract_error_context(b)
+          fixup_result = fixup_iteration(llmc, 0.3, repo, sha, error_context, "", 
+                                         llmc_fast, 768, 2048, 3)
+                                      
+          if fixup_result[:success]
+            # Commit fixup changes
+            repo.index.write
+            commit_oid = Rugged::Commit.create(repo, {
+              tree: repo.index.write_tree(repo),
+              author: { email: "snajpa@snajpa.net", name: "Pavel Snajdr (via rllm)", time: Time.now },
+              committer: { email: "snajpa@snajpa.net", name: "Pavel Snajdr (via rllm)", time: Time.now },
+              message: "Fixup iteration #{fixup_iter}",
+              parents: [repo.head.target],
+              update_ref: "HEAD"
+            })
+            repo.reset(commit_oid, :hard)
+            #reset_target = commit_oid
+          end
+        else
+          break
         end
-        puts
-        puts diff.patch
-
-        fixup_patch_str = ""
-        fixup_patch_str += "commit #{commit_oid}\n"
-        fixup_patch_str += "Author: #{repo.lookup(commit_oid).author[:name]} <#{repo.lookup(commit_oid).author[:email]}>\n"
-        fixup_patch_str += "Date:   #{repo.lookup(commit_oid).author[:time]}\n"
-        fixup_patch_str += "\n"
-        repo.lookup(commit_oid).message.each_line do |line|
-          fixup_patch_str += "    #{line}"
-        end
-        fixup_patch_str += "\n"
-        fixup_patch_str += diff.patch
       end
     end
   end
+  
+  results
+end
+
+# Main execution
+begin
+  results = process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, repo, src_sha, commit_list, dst_branch_name)
 rescue Interrupt => e
-  puts "Merge iteration interrupted: #{e.message}"
-  puts "Saving merge results"
-  f = File.open('merge_results.bin', 'w')
-  f.write(Marshal.dump(prev_results))
-  f.close
+  puts "Process interrupted: #{e.message}"
 end
