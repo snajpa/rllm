@@ -4,6 +4,56 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
   reask_block = ""
   ask_block = ""
   asks = []
+
+  prompt_reask = <<~PROMPT
+  ============================================================================================
+
+  Now is your last chance to ask for further context! If you need more information to resolve the task at hand, please ask for it now.
+
+  When you're done, please type ASK: close to finish the session.
+
+  The format is an ask per line, per line format is ASK: <tool> <parameter1> [<parameter2> ...]. Available tools are:
+  - Grep with added context:
+    - Syntax:
+        ASK: grep-context-n "<pattern>" <relative_path_or_glob_path1> [<relative_path_or_glob_path2> ...]
+    - Description: grep recursively for a pattern.
+    - Instructions for use: Put the pattern in quotes properly. Use paths relative to the root of the repository, either a files or directories, . for the whole repo, can use a glob pattern
+    - Mandatory parameters: pattern, relative_path_or_glob_path1
+  - Cat with added context:
+    - Syntax:
+        ASK: cat-context <line_number> <relative_path>      
+    - Description: show the context around a line in a file.
+    - Instructions for use: Use the line number and the path relative to the root of the repository.
+    - Mandatory parameters: line_number, relative_path
+  - Blame line:
+    - Syntax:
+        ASK: blame-line <line_number> <relative_path>
+    - Description: show the git blame for a line in a file.
+    - Instructions for use: Use the line number and the path relative to the root of the repository.
+    - Mandatory parameters: line_number, relative_path
+  - Close the context gathering:
+    - Syntax:
+        ASK: close
+    - Description: end the context gathering when sufficient context is gathered.
+    - Instructions for use: Use this when you have enough context to confidently resolve the task at hand.
+
+  The ask should be in this format:
+  ASK: <tool> <parameter1> [<parameter2> ...]
+
+  When you have sufficient context, type ASK: close to finish the session.
+
+  Analyze the content before the divider line to understand the context of the task at hand.
+
+  If there is a code block for you to edit, gather all the relevant information for the edit. Make sure you have context for all the lines to be edited.
+  If there is a bug to be fixed, gather all the relevant information to the bug at hand. Make sure you have context for all the lines to be fixed.
+  If there is a task to be performed, gather all the relevant information to the task at hand. Make sure you have context for all the lines to be affected.
+
+  Gather all the relevant information to the task at hand by giving asks that are specific and focused rather than broad and general.
+
+  PROMPT
+
+  warmup_kv_cache_common_prompt(llmc, prompt_common + prompt_reask)
+  
   while valid_lines < max_valid_lines
     iters += 1
     if iters > reask_iter_limit
@@ -15,56 +65,10 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
     max_digits_i = reask_iter_limit.to_s.length
     print "%#{max_digits_i}d/%#{max_digits_i}d iters %#{max_digits_l}d/%#{max_digits_l}d lines, ask: " % [iters, reask_iter_limit, valid_lines, max_valid_lines]
 
-    prompt_reask = <<~PROMPT
-    ============================================================================================
-
-    Now is your last chance to ask for further context! If you need more information to resolve the task at hand, please ask for it now.
-
-    When you're done, please type ASK: close to finish the session.
-
-    The format is an ask per line, per line format is ASK: <tool> <parameter1> [<parameter2> ...]. Available tools are:
-    - Grep with context:
-      - Syntax:
-          ASK: grep-context-n <pattern> <relative_path_or_glob_path1> [<relative_path_or_glob_path2> ...]
-      - Description: grep recursively for a pattern in path or glob path - use relative paths, either a files or directories, . for the whole repo
-      - Mandatory parameters: pattern, relative_path_or_glob_path1
-    - Cat with context:
-      - Syntax:
-          ASK: cat-context <line_number> <relative_path>      
-      - Description: show the context around a line in a file
-      - Mandatory parameters: line_number, relative_path
-    - Blame line:
-      - Syntax:
-          ASK: blame-line <line_number> <relative_path>
-      - Description: show the git blame for a line in a file
-      - Mandatory parameters: line_number, relative_path
-    - Close the context gathering:
-      - Syntax:
-          ASK: close
-      - Description: end the context gathering when sufficient context is gathered
-
-    The ask should be in this format:
-    ASK: <tool> <parameter1> [<parameter2> ...]
-
-    When you have sufficient context, type ASK: close to finish the session.
-
-    Analyze the content before the divider line to understand the context of the task at hand.
-
-    If there is a code block for you to edit, gather all the relevant information for the edit. Make sure you have context for all the lines to be edited.
-    If there is a bug to be fixed, gather all the relevant information to the bug at hand. Make sure you have context for all the lines to be fixed.
-    If there is a task to be performed, gather all the relevant information to the task at hand. Make sure you have context for all the lines to be affected.
-
-    Gather all the relevant information to the task at hand by giving asks that are specific and focused rather than broad and general.
-
-    PROMPT
-
-    warmup_kv_cache_common_prompt(llmc, prompt_common + prompt_reask)
-
     if ask_block.empty?
       prompt_reask += <<~PROMPT
       
-      ---------------------
-      No previous asks from you currently, here are examples for you to understand the required format:
+      Your previous asks with their results:
 
       ASK: grep-rn hello
       RESULT:
@@ -73,32 +77,27 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
       ```
       1 hello world
       ```
-      
-      BUDGET_LEFT: 100 lines and 10 asks
-      
-      ASK: close
-      RESULT:
-      Done asking for more context
-      
-      Examples end here.
-
-      ---------------------
+    
+      BUDGET_LEFT: 100 lines and 10 asks      
 
       PROMPT
     else
+      #prompt_reask_v0 = <<~PROMPT
+      #
+      #Your previous asks with their results:
+      ##{reask_block}
+      #
+      #Currently, you have already asked for the following:
+      ##{asks.map { |tool, params_str| "ASK: #{tool} #{params_str}" }.join("\n")}
+      #
+      #Which lead to the following gathered context:
+      #
+      ##{ask_block}
+      #
+      #PROMPT
       prompt_reask += <<~PROMPT
-      
-      ---------------------
-      Your previous asks with their results:
-      #{reask_block}
-      ---------------------
 
-      
-      ---------------------
-      Simple list of at least correctly parsed asks:
-      #{asks.map { |tool, params_str| "ASK: #{tool} #{params_str}" }.join("\n")}
-      ---------------------
-      
+      #{ask_block}
 
       PROMPT
     end
@@ -106,16 +105,15 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
 
     BUDGET_LEFT: #{max_valid_lines - valid_lines}
 
-    Please respond in the format ASK: <tool> <parameter1> [<parameter2> ...] to ask for more context.
-
     Pick the most relevant tool to ask for the context you need to resolve the task at hand, or close the context gathering if you have enough context using ASK: close.
+
+    Please respond in the format ASK: <tool> <parameter1> [<parameter2> ...].
   
-    ---------------------
-    Next ask:
-    
+    Your next ASK:
+
     PROMPT
-  #puts prompt_common
-    #puts prompt_reask
+    puts prompt_common
+    puts prompt_reask
 
     ask = ""
     ask_match = nil
@@ -127,7 +125,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
           max_tokens: 128,
           stream: proc do |chunk, _bytesize|
             ask += chunk["choices"].first["text"]
-            #print chunk["choices"].first["text"]
+            print chunk["choices"].first["text"]
 
             if ask =~ /\s*ASK:.*\n.*$/
               throw :close
@@ -164,7 +162,8 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
     # If duplicate ask
     if asks.include?([tool, params_str])
       puts ": Dupla"
-      reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Duplicate ask, you need to think harder than this.\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
+      #iters -= 1
+      reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: DUPLICATE REQUEST REJECTED.\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
       next
     end
     asks << [tool, params_str]
@@ -193,7 +192,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
           globbed_files.each do |file|
             relative_path = Pathname.new(file).relative_path_from(Pathname.new(repo.workdir)).to_s
             if File.exist?(File.join(repo.workdir, relative_path))
-              puts "\n: Adding globbed path: #{relative_path}"
+              #puts "\n: Adding globbed path: #{relative_path}"
               files << relative_path
             else
               puts "\n: Invalid file or glob pattern - SHOULD NOT GET HERE EVER: #{relative_path}"
@@ -216,7 +215,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
       end
       if pattern.strip.empty?
         puts ": Invalid ask"
-        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR:Invalid ask\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
+        #reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR:Invalid ask\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
         next
       end
       params = [pattern] + files
@@ -264,7 +263,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
         end
       rescue
         puts ": Invalid ask"
-        reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Invalid ask, syntax is ASK: cat-context <line_number> <relative_path>\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
+        #reask_block += "\nASK: #{tool} #{params_str}\nRESULT:\nERROR: Invalid ask, syntax is ASK: cat-context <line_number> <relative_path>\nBUDGET_LEFT: #{max_valid_lines - valid_lines} lines and #{reask_iter_limit - iters} asks"
         next
       end
       if file.empty?

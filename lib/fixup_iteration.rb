@@ -204,6 +204,8 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     file = location[:file]
     file = file[2..-1] if file.start_with?("./")
 
+    p location
+    
     file_path = File.join(repo.workdir, file)
     next unless File.exist?(file_path)
 
@@ -249,11 +251,21 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
 
     puts "Blaming commit for #{file}:#{location[:start_line]}"
     blamed_commit_oid = ""
+    blamed_commit_msg_first_line = ""
+    blamed_commit_str_numbered = "<not available>"
     begin
       full_path = File.join(repo.workdir, file)
       blame_line = `cd #{repo.workdir}; git blame -l -L #{location[:start_line]},#{location[:start_line]} #{file}`.split("\n")
       p blame_line
       blamed_commit_oid = blame_line.last.split(" ")[0]
+      if blamed_commit_oid.start_with?("^")
+        blamed_commit_oid = ""
+      #blamed_commit_oid = blamed_commit_oid[0..-2] if blamed_commit_oid.end_with?("~")
+      #first_commit_in_repo_oid = `cd #{repo.workdir}; git rev-list --max-parents=0 HEAD`.strip
+      #if blamed_commit_oid == first_commit_in_repo_oid
+        blamed_commit_oid = ""
+        blamed_commit_str_numbered = "<first commit in repository, too large to display>"
+      end
     rescue => e
       puts "Failed to get blamed commit for #{file}:#{location[:start_line]}: #{e.message}"
       puts e.backtrace
@@ -261,6 +273,9 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     puts "Blamed commit: #{blamed_commit_oid}"
     unless blamed_commit_oid.nil? || blamed_commit_oid.empty?
       blamed_commit = repo.lookup(blamed_commit_oid)
+    end
+    unless blamed_commit.nil?
+      blamed_commit_msg_first_line = blamed_commit.message.split("\n").first
       blamed_commit_str = "```\n"
       blamed_commit_str += "commit #{sha}\n"
       blamed_commit_str += "Author: #{blamed_commit.author[:name]} <#{blamed_commit.author[:email]}>\n"
@@ -271,7 +286,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
       blamed_commit_str += "\n"
       blamed_commit_str += blamed_commit.diff(blamed_commit.parents.first).patch
       blamed_commit_str += "\n"
-      blamed_commit_str = "```\n"
+      blamed_commit_str += "```\n"
       blamed_commit_str_lines = blamed_commit_str.split("\n")
       blamed_commit_str_numbered = ""
       max_lineno_length = blamed_commit_str_lines.size.to_s.size
@@ -280,8 +295,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
       end
       blamed_commit_str_numbered = blamed_commit_str_numbered.force_encoding('UTF-8')        
     end
-    blamed_commit_str_numbered ||= "<not available>"
-    puts "Blamed commit str length: #{blamed_commit_str_numbered.lines.size}"
+    puts "Blamed commit str length: #{blamed_commit_str_numbered.split("\n").size}"
 
     edit_prompt = <<~PROMPT
     You are tasked to fix build errors after a failed merge attempt.

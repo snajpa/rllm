@@ -87,7 +87,7 @@ def warmup_kv_cache_common_prompt(client, common_prompt)
     #puts "KV cache unsupported. Skipping..."
     return
   elsif ret == 400
-    print "(KV miss: #{ret}..."
+    print "(KV #{ret}..."
     client.completions(
       parameters: {
         temperature: 0.0,

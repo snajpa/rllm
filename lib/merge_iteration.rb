@@ -88,8 +88,6 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       porting_step[:first_block_start] = first_block_start
       porting_step[:first_block_end] = first_block_end
 
-      puts "Code block start: #{first_block_start+1}, end: #{first_block_end+1}"
-
       original_block = ""
       # Get the file content from the immediate parent commit
       parent_commit = commit.parents.first
@@ -268,6 +266,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       PROMPT
   
       puts "Resolving conflict in #{path}:"
+      puts "Code block start: #{first_block_start+1}, end: #{first_block_end+1}"
 
       #puts prompt_common
       #puts prompt_mergeblock

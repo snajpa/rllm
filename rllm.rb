@@ -22,7 +22,7 @@ require_relative './lib/utils'
 # Configuration
 # cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_F16=true -DGGML_CUDA_PEER_MAX_BATCH_SIZE=256 -DGGML_CUDA_FA_ALL_QUANTS=true
 # CUDA_VISIBLE_DEVICES="1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/granite-3.1-8b-instruct.Q8_0.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8080 -fa -ctk q4_0 -ctv q4_0 --slot-save-path ~/tmp/llama-cache/
-# CUDA_VISIBLE_DEVICES="0,1,2" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8081 -fa -ctk q4_0 -ctv q4_0 -ts 20,5,20 -mg 1 -ub 512 -b 4096 --slot-save-path ~/tmp/llama-cache/
+# CUDA_VISIBLE_DEVICES="0,1,2" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8081 -fa -ctk q4_0 -ctv q4_0 -ts 20,4,20 -mg 1 -ub 512 -b 4096 --slot-save-path ~/tmp/llama-cache/
 # Nhrs=6; find ~/tmp/llama-cache/ -type f -amin +$(($Nhrs * 60)) -exec rm {} \;
 
 $caching_enabled = true
@@ -35,7 +35,7 @@ options = {}
 
 repo_dir = '/home/snajpa/linux'
 
-src_sha = '0bc21e701a6f' # random linux commit
+src_sha = 'b62cef9a5c67' # random linux commit
 #cherrypick_commit_range = '319addc2ad90..cf9971c0322e' # upto: tmpfs: use 1/2 of memcg limit if present v3
 cherrypick_commit_range = 'd3e69f8ab5df..c09b3eaeafd9' # syslog-ns
 #src_sha = '0bc21e701a6f' # 6.13-rc5+
@@ -164,22 +164,24 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
 
       # Try merge iteration
       result = merge_iteration(llmc, 0.8, repo, reset_target, dst_branch_name, src_sha, sha, llmc_fast,
-                               768, 2048, 1*iter, results[sha], error_context)
+                               768, 2048, 25*iter, results[sha], error_context)
       results[sha] = result if result[:resolved]
+      #next unless result[:resolved]
+
+      #reset_target = result[:reset_target]
+
+      # Only do this if we're doing the last commit
+    #  unless n_commit == n_commits
+    #    #puts "#{iters_str}Skipping build for non-last commit"
+    #    reset_target = result[:commited_as]
+    #    build_ok = true
+    #    next
+    #  end
       
       unless result[:llm_ported]
         # Validation not needed when LLM didn't touch the code
         build_ok = true
         reset_target = result[:commited_as]
-        next
-      end
-
-      #reset_target = result[:reset_target]
-
-      # Only do this if we're doing the last commit
-      unless n_commit == n_commits
-        #puts "#{iters_str}Skipping build for non-last commit"
-        build_ok = true
         next
       end
       
@@ -192,7 +194,7 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
       end
       next unless pushed
       
-      10.times do |fixup_iter|
+      15.times do |fixup_iter|
         puts "#{iters_str}Build and fixup iteration #{fixup_iter}\n\n"
         # Try build
         b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
@@ -203,7 +205,7 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
           puts "#{iters_str}Build failed, trying to fixup the error, iteration #{fixup_iter}"
           error_context = extract_error_context(b)
           fixup_result = fixup_iteration(llmc, 0.3, repo, sha, error_context, "", 
-                                         llmc_fast, 768, 2048, 1*iter)             
+                                         llmc_fast, 768, 2048, 25*iter)             
           if fixup_result[:success]
             # Commit fixup changes
             repo.index.write
