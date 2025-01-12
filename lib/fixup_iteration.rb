@@ -2,37 +2,19 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
   # Strip ANSI codes, parse errors (keep existing code)
   ansi_regex = /\x1b(?:[@-Z\\-_]|\[[0-?]*[ -\/]*[@-~]|\][^@\x07]*[@\x07]|\x7f)/
   error_lines = build_output.split("\n").map { |l| l.gsub(ansi_regex, "") }
+  build_output = build_output.force_encoding('UTF-8')
   parsed_error_lines = []
   error_files = []
-
-  merged_commit = repo.lookup(sha)
-  merged_commit_str = ""
-  merged_commit_str += "commit #{sha}\n"
-  merged_commit_str += "Author: #{merged_commit.author[:name]} <#{merged_commit.author[:email]}>\n"
-  merged_commit_str += "Date: #{Time.at(merged_commit.time)}\n"
-  merged_commit_str += "\n"
-  merged_commit_str += merged_commit.message
-  merged_commit_str += "\n"
-  merged_commit_str += "\n"
-  merged_commit_str += merged_commit.diff(merged_commit.parents.first).patch
-  merged_commit_str += "\n"
-  merged_commit_str_lines = merged_commit_str.split("\n")
-  merged_commit_str_numbered = ""
-  max_lineno_length = merged_commit_str_lines.size.to_s.size
-  merged_commit_str_lines.each_with_index do |line, index|
-    merged_commit_str_numbered += "%#{max_lineno_length}d %s\n" % [index + 1, line]
-  end
-  merged_commit_str_numbered = merged_commit_str_numbered.force_encoding('UTF-8')
-
 
   error_lines.each do |line|
     match = line.match(/^(.+):(\d+):(\d+):(.+)$/)
     next unless match
     type = case
            when match[4] =~ /error/i then "error"
-           when match[4] =~ /warning/i then "warning"
+          # when match[4] =~ /warning/i then "warning"
            else "unknown"
            end
+    next if type == "unknown"
     parsed_error_lines << {
       file: match[1],
       line: match[2].to_i,
@@ -52,6 +34,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
       last_patch_str_numbered += "%#{max_lineno_length}d %s\n" % [index + 1, line]
     end
   end
+  last_patch_str_numbered = last_patch_str_numbered.force_encoding('UTF-8')
 
   initial_prompt = ""
   # First pass - let LLM gather context about errors
@@ -65,18 +48,18 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
   You can ask for more context before deciding what to edit.
   PROMPT
 
-  if !last_patch_str_numbered.empty?
-    initial_prompt += <<~PROMPT
-  
-    This is a next iteration of the fixup process on top of new merge results.
-
-    During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
-    
-    ```
-    #{last_patch_str_numbered}
-    ```  
-    PROMPT
-  end
+  #if !last_patch_str_numbered.empty?
+  #  initial_prompt += <<~PROMPT
+  #
+  #  This is a next iteration of the fixup process on top of new merge results.
+#
+  #  During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
+  #  
+  #  ```
+  #  #{last_patch_str_numbered}
+  #  ```  
+  #  PROMPT
+  #end
 
   initial_prompt += <<~PROMPT
 
@@ -100,18 +83,11 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
   edit_suggestions_prompt_common = <<~PROMPT
   You are tasked to fix build errors after a failed merge attempt.
 
-  The original version of the commit before porting it onto this state of codebase is:
-
-  ```
-  #{merged_commit_str_numbered}
-  ```
   PROMPT
 
   warmup_kv_cache_common_prompt(llmc, edit_suggestions_prompt_common)
-  
-  edit_suggestions_prompt = <<~PROMPT
-  #{edit_suggestions_prompt_common}
 
+  edit_suggestions_prompt = edit_suggestions_prompt_common + <<~PROMPT
   Given these build errors and context:
 
   Errors:
@@ -122,19 +98,19 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
 
   PROMPT
 
-  if !last_patch_str_numbered.empty?
-    edit_suggestions_prompt += <<~PROMPT
-  
-    Note: This is a next iteration of the fixup process on top of new merge results.
-
-    During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
-    
-    ```
-    #{last_patch_str_numbered}
-    ```
-
-    PROMPT
-  end
+  #if !last_patch_str_numbered.empty?
+  #  edit_suggestions_prompt += <<~PROMPT
+  #
+  #  Note: This is a next iteration of the fixup process on top of new merge results.
+#
+  #  During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
+  #  
+  #  ```
+  #  #{last_patch_str_numbered}
+  #  ```
+#
+  #  PROMPT
+  #end
 
   edit_suggestions_prompt += <<~PROMPT
   
@@ -154,6 +130,8 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
 
   EDIT: relative_path_to_file:start_line[-end_line] # rationale for edit
 
+  Each EDIT suggestion line must start with "EDIT:" and contain the relative path to the file, the line number or range of lines to edit, and the rationale for the edit.
+
   You can only specify one range per file. If you need to edit multiple ranges in the same file, please specify them separately.
 
   Your response will be used to guide the editing process for each individual file location.
@@ -167,11 +145,11 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
   PROMPT
 
   edit_suggestions = []
-  response = ""
+  edit_suggestions_response = ""
   while edit_suggestions.empty?
     # Get edit locations
     edit_suggestions = []
-    response = ""
+    edit_suggestions_response = ""
     catch(:close) do
       llmc.completions(
         parameters: {
@@ -179,9 +157,9 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
           prompt: edit_suggestions_prompt,
           max_tokens: 2048,
           stream: proc do |chunk, _bytesize|
-            response += chunk["choices"].first["text"]
+            edit_suggestions_response += chunk["choices"].first["text"]
             print chunk["choices"].first["text"]
-            if response.include?("END_RESPONSE")
+            if edit_suggestions_response.include?("END_RESPONSE")
               throw :close
             end
           end
@@ -189,12 +167,12 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
       )
     end
     puts
-    edit_suggestions_response = response.force_encoding('UTF-8')
+    edit_suggestions_response = edit_suggestions_response.force_encoding('UTF-8')
 
     edit_suggestions_response.split("\n").each do |line|
       # Match EDIT: relative_path_to_file:start_line-end_line # rationale for edit
       # or EDIT: relative_path_to_file:start_line # rationale for edit
-      if line =~ /^EDIT\**:\s*([^:]+):(\d+(?:-\d+)?)\s*#\s*(.*)$/
+      if line =~ /^\s*\**\s*EDIT\s*\**:\s*([^:]+):(\d+(?:-\d+)?)\s*#\s*(.*)$/
         file = $1.strip
         range = $2.strip
         rationale = $3.strip
@@ -232,12 +210,26 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     puts "Processing edit for #{file} lines #{location[:start_line] + 1}-#{location[:end_line] + 1}"
 
     puts "Gathering additional context for edit #{file} lines #{location[:start_line] + 1}-#{location[:end_line] + 1}"
-    # Get context like in merge_iteration
+
+    initial_prompt = <<~PROMPT
+    You are tasked to fix build errors after a failed merge attempt.
+
+    Given these build errors and warnings:
+
+    #{parsed_error_lines.map { |e| "#{e[:file]}:#{e[:line]}:#{e[:column]}: #{e[:message]}" }.join("\n")}
+    
+    You are editing #{file} lines #{location[:start_line] + 1}-#{location[:end_line] + 1}.
+
+    The rationale for this edit is: #{location[:rationale]}.
+
+    PROMPT
+
+    # Get additional context like in merge_iteration
     ask_block = ask_and_gather_context(
       repo,
       reask_llmc,
       temperature,
-      file,
+      initial_prompt,
       reask_perask_lines,
       reask_valid_lines,
       reask_iter_limit
@@ -250,19 +242,57 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     end_line = [file_content.size - 1, location[:end_line] + context_around].min
     
     edit_block = ""
+    max_lineno_length = file_content.size.to_s.size
     (start_line..end_line).each do |i|
-      edit_block += "%d %s\n" % [i + 1, file_content[i]]
+      edit_block += "%#{max_lineno_length}d %s\n" % [i + 1, file_content[i]]
     end
+
+    puts "Blaming commit for #{file}:#{location[:start_line]}"
+    blamed_commit_oid = ""
+    begin
+      full_path = File.join(repo.workdir, file)
+      blame_line = `cd #{repo.workdir}; git blame -l -L #{location[:start_line]},#{location[:start_line]} #{file}`.split("\n")
+      p blame_line
+      blamed_commit_oid = blame_line.last.split(" ")[0]
+    rescue => e
+      puts "Failed to get blamed commit for #{file}:#{location[:start_line]}: #{e.message}"
+      puts e.backtrace
+    end
+    puts "Blamed commit: #{blamed_commit_oid}"
+    unless blamed_commit_oid.nil? || blamed_commit_oid.empty?
+      blamed_commit = repo.lookup(blamed_commit_oid)
+      blamed_commit_str = "```\n"
+      blamed_commit_str += "commit #{sha}\n"
+      blamed_commit_str += "Author: #{blamed_commit.author[:name]} <#{blamed_commit.author[:email]}>\n"
+      blamed_commit_str += "Date: #{Time.at(blamed_commit.time)}\n"
+      blamed_commit_str += "\n"
+      blamed_commit_str += blamed_commit.message
+      blamed_commit_str += "\n"
+      blamed_commit_str += "\n"
+      blamed_commit_str += blamed_commit.diff(blamed_commit.parents.first).patch
+      blamed_commit_str += "\n"
+      blamed_commit_str = "```\n"
+      blamed_commit_str_lines = blamed_commit_str.split("\n")
+      blamed_commit_str_numbered = ""
+      max_lineno_length = blamed_commit_str_lines.size.to_s.size
+      blamed_commit_str_lines.each_with_index do |line, index|
+        blamed_commit_str_numbered += "%#{max_lineno_length}d %s\n" % [index + 1, line]
+      end
+      blamed_commit_str_numbered = blamed_commit_str_numbered.force_encoding('UTF-8')        
+    end
+    blamed_commit_str_numbered ||= "<not available>"
+    puts "Blamed commit str length: #{blamed_commit_str_numbered.lines.size}"
 
     edit_prompt = <<~PROMPT
     You are tasked to fix build errors after a failed merge attempt.
 
-    Given these build errors and context:
+    These are the these build errors we have:
     ========================
     #{build_output}
     ========================
 
-    And some guidance on what to edit:
+    We have already picked what we're going to edit and why. Here are the overall edit suggestions:
+
     #{edit_suggestions_response}
     
     We're solving the errors of #{file} now.
@@ -273,23 +303,31 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
 
     PROMPT
 
-    if !last_patch_str_numbered.empty?
-      edit_prompt += <<~PROMPT
-    
-      Note: This is a next iteration of the fixup process on top of new merge results.
-
-      During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
-      
-      ```
-      #{last_patch_str_numbered}
-      ```  
-      PROMPT
-    end
+    #if !last_patch_str_numbered.empty?
+    #  edit_prompt += <<~PROMPT
+    #
+    #  Note: This is a next iteration of the fixup process on top of new merge results.
+    #
+    #  During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
+    #  
+    #  ```
+    #  #{last_patch_str_numbered}
+    #  ```  
+    #  PROMPT
+    #end
 
     edit_prompt += <<~PROMPT
 
     Here is the additional context for this edit:
     #{ask_block}
+
+    Considering this additional context, you can diverge from the original edit suggestion if needed.
+
+    For full context, read through the commit that introduced the error, which we would like to fix to get it working properly.
+    
+    The original version of the commit before porting it onto this state of codebase is:
+
+    #{blamed_commit_str_numbered}
 
     And finally, here is the code block from #{file} for you to edit:
     ```
@@ -304,7 +342,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     2. You must begin with the first line of the code block.
     3. Produce complete integrated version of the edited code block.
     4. By prefixing each line with the line number, ensure your edited code lands in the correct location.
-    5. If you need to remove a line, omit it from the response.
+    5. If you need to remove a line, just skip it completely.
     6. You are forbidden from adding comments or annotations to the code block.
     7. End with "```".
 
@@ -331,8 +369,10 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
           stream: proc do |chunk, _bytesize|
             response += chunk["choices"].first["text"]
             print chunk["choices"].first["text"]
+
+            block_marker_count = response.split("\n").select { |line| line.start_with?("```") }.size
             
-            if response.include?("```") && response.split("```").size >= 3
+            if block_marker_count >= 2
               throw :close
             end
           end
@@ -358,14 +398,15 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
         end
       end
     end
-
+    solution_numbered_hash = solution_numbered_hash.sort.to_h
+    
     if !solution_numbered_hash.empty?
       solution_start = solution_numbered_hash.keys.min
       solution_end = solution_numbered_hash.keys.max
 
       # Validate line numbers
       if solution_start != location[:start_line]
-        
+        return { success: false, message: "Failed - solution start line does not match requested line" }
       end
       error = false
       #solution_end.downto(solution_start) do |line_number|
@@ -389,10 +430,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
       
       # Add lines before fix
       file_content.each_with_index do |line, index|
-        if index >= solution_end
-          break
-        end
-        if index < solution_start 
+        if index < solution_start
           new_content << line
         end
       end
@@ -404,24 +442,24 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
 
       # Add remaining lines
       file_content.each_with_index do |line, index|
-        if index > solution_end
+        if (index + 1) >= solution_end
           new_content << line
         end
       end
 
       begin
-        File.open(file_path, 'w') { |f| f.write(new_content.join("\n")) }
+        File.open(file_path, 'w') { |f| f.write(new_content.join("\n") + "\n") }
         repo.index.add(file)
         puts "Successfully applied changes to #{file}"
         true
       rescue => e
         puts "Failed to apply changes to #{file}: #{e.message}"
         puts e.backtrace
-        false
+        redo
       end
     else
       puts "Failed - no valid numbered lines found in solution"
-      false
+      redo
     end
   end
 

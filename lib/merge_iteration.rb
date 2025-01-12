@@ -88,11 +88,19 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       porting_step[:first_block_start] = first_block_start
       porting_step[:first_block_end] = first_block_end
 
+      puts "Code block start: #{first_block_start+1}, end: #{first_block_end+1}"
+
       original_block = ""
       # Get the file content from the immediate parent commit
       parent_commit = commit.parents.first
-      parent_tree = parent_commit.tree
-      parent_blob = parent_tree.path(path)[:oid]
+      begin
+        parent_tree = parent_commit.tree
+        parent_blob = parent_tree.path(path)[:oid]
+      rescue => e
+        puts "Error getting parent commit for #{sha}: #{e.message}"
+        puts e.backtrace
+        next
+      end
       if parent_blob
         parent_content = repo.lookup(parent_blob).content
         parent_content_array = parent_content.split("\n")
@@ -203,12 +211,14 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       For reference, this is the state of the code the commit works on:
 
       ```
-      #{old_block}```
+      #{old_block}
+      ```
 
       Carefully mind the current state of code we're merging this commit onto:
 
       ```
-      #{original_block}```
+      #{original_block}
+      ```
       PROMPT
 
       prompt_common = prompt_common_warmup + <<~PROMPT
@@ -222,7 +232,8 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
 
       There is a merge conflict in the following code block:
       ```
-      #{conflicted_block}```
+      #{conflicted_block}
+      ```
 
       PROMPT
 
@@ -289,10 +300,10 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       puts
       porting_step[:response] = response
 
-      blocks = response.split("\n").reverse
+      lines = response.split("\n").reverse
       solution = ""
       in_block = false
-      blocks.each do |line|
+      lines.each do |line|
         if line.start_with?("```")
           in_block = !in_block
         elsif in_block
@@ -307,6 +318,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
         solution_array.each_with_index do |line, index|
           if line =~ /^(\s{0,5}\d{1,6}) (.*)$/
             solution_numbered_hash[$1.to_i-1] = $2
+            solution_numbered_hash[$1.to_i-1] ||= ""
           end
         end
         solution_start = solution_numbered_hash.keys.min
@@ -334,9 +346,6 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
 
         # Arrive at solution
         file_array.each_with_index do |line, index|
-          if index >= first_block_end
-            break
-          end
           if index < first_block_start
             new_content << line
           end
@@ -354,7 +363,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
         # Write resolved file
         temp_path = "#{full_path}.tmp"
         begin
-          File.open(temp_path, 'w') { |f| f.write(new_content.join("\n")) }
+          File.open(temp_path, 'w') { |f| f.write(new_content.join("\n") + "\n") }
           FileUtils.mv(temp_path, full_path)
         rescue => e
           FileUtils.rm(temp_path) if File.exist?(temp_path)
@@ -390,7 +399,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
             tree: repo.index.write_tree(repo),
             author: commit.author,
             committer: commit.committer,
-            message: commit.message + " [ported]",
+            message: "[rllm-ported] " + commit.message + "\nPorted-by: rllm\n",
             parents: [repo.head.target],
             update_ref: 'HEAD'
           })
@@ -410,7 +419,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
         tree: repo.index.write_tree(repo),
         author: commit.author,
         committer: commit.committer,
-        message: commit.message + " [rllm-ported]",
+        message: commit.message,
         parents: [repo.head.target],
         update_ref: 'HEAD'
       })

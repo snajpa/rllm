@@ -23,6 +23,7 @@ require_relative './lib/utils'
 # cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_F16=true -DGGML_CUDA_PEER_MAX_BATCH_SIZE=256 -DGGML_CUDA_FA_ALL_QUANTS=true
 # CUDA_VISIBLE_DEVICES="1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/granite-3.1-8b-instruct.Q8_0.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8080 -fa -ctk q4_0 -ctv q4_0 --slot-save-path ~/tmp/llama-cache/
 # CUDA_VISIBLE_DEVICES="0,1,2" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8081 -fa -ctk q4_0 -ctv q4_0 -ts 20,5,20 -mg 1 -ub 512 -b 4096 --slot-save-path ~/tmp/llama-cache/
+# Nhrs=6; find ~/tmp/llama-cache/ -type f -amin +$(($Nhrs * 60)) -exec rm {} \;
 
 $caching_enabled = true
 
@@ -34,20 +35,13 @@ options = {}
 
 repo_dir = '/home/snajpa/linux'
 
-src_sha = ""
-cherrypick_commit_range = ""
-if false
 src_sha = '0bc21e701a6f' # random linux commit
+#cherrypick_commit_range = '319addc2ad90..cf9971c0322e' # upto: tmpfs: use 1/2 of memcg limit if present v3
 cherrypick_commit_range = 'd3e69f8ab5df..c09b3eaeafd9' # syslog-ns
-end
-if true
-  src_sha = '0bc21e701a6f' # 6.13-rc5+
-  cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e'
-end
-if false
-  src_sha = '8155b4ef3466' # next-20240104
-  cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68' # from 6.12.7
-end
+#src_sha = '0bc21e701a6f' # 6.13-rc5+
+#cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e' # full stack from 6.12.7
+#src_sha = '8155b4ef3466' # next-20240104
+#cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68'
 
 dst_branch_name = 'vpsadminos-devel'
 dst_remote_name = 'origin'
@@ -100,17 +94,23 @@ puts "Destination remote: #{dst_remote_name}"
 puts "Repository: #{repo_dir}"
 
 def extract_error_context(b)
-  error_context_lines = []
-  was_error = false
-  b[:results].last[:output_lines].each do |line|
+  error_context_lines = {}
+  error_lines = []
+  b[:results].last[:output_lines].each_with_index do |line, index|
     if line =~ /error:/i
-      was_error = true
-    end
-    if was_error
-      error_context_lines << line
+      error_lines << index
     end
   end
-  error_context_lines.join("\n")
+  error_lines.each do |line|
+    start = [0, line - 5].max
+    stop = [b[:results].last[:output_lines].size - 1, line + 5].min
+    b[:results].last[:output_lines].each_with_index do |line, index|
+      if index >= start && index <= stop
+        error_context_lines[index] = line
+      end
+    end
+  end
+  error_context_lines.sort.join("\n") + "\n"
 end
 
 prev_results = {}
@@ -134,15 +134,6 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
   results = {}
   src_commit = repo.lookup(src_sha)
   
-  # Setup initial branch state
-  repo.reset(src_commit.oid, :hard)
-  repo.checkout(src_commit.oid)
-  begin
-    repo.branches.delete(dst_branch_name)
-  rescue Rugged::ReferenceError
-  end
-  repo.branches.create(dst_branch_name, src_commit.oid)
-  repo.checkout("refs/heads/#{dst_branch_name}")
   reset_target = src_commit.oid
   
   n_commits = commit_list.size
@@ -155,21 +146,39 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
     error_context = ""
     max_iterations = 10
     iter = 0
-    
     while !build_ok && iter < max_iterations
       iter += 1
-      
-      puts "\n#{iter}/#{max_iterations} iters: Processing commit #{n_commit}/#{n_commits}: #{sha[0..7]} - #{commit.message.split("\n").first}"
+      commit_str = "#{sha[0..7]} - #{commit.message.split("\n").first}"
+      iters_str = "\n#{iter}/#{max_iterations} iters, commit: #{n_commit}/#{n_commits} #{commit_str}: "
+      puts "#{iters_str} merging commit"
+
+      # Setup initial branch state
+      repo.reset(reset_target, :hard)
+      repo.checkout(reset_target)
+      begin
+        repo.branches.delete(dst_branch_name)
+      rescue Rugged::ReferenceError
+      end
+      repo.branches.create(dst_branch_name, reset_target)
+      repo.checkout("refs/heads/#{dst_branch_name}")
 
       # Try merge iteration
       result = merge_iteration(llmc, 0.8, repo, reset_target, dst_branch_name, src_sha, sha, llmc_fast,
-                               768, 2048, 2*iter, results[sha], error_context)
+                               768, 2048, 1*iter, results[sha], error_context)
       results[sha] = result if result[:resolved]
+      
+      unless result[:llm_ported]
+        # Validation not needed when LLM didn't touch the code
+        build_ok = true
+        reset_target = result[:commited_as]
+        next
+      end
+
       #reset_target = result[:reset_target]
 
       # Only do this if we're doing the last commit
       unless n_commit == n_commits
-        puts "Skipping build for non-last commit"
+        #puts "#{iters_str}Skipping build for non-last commit"
         build_ok = true
         next
       end
@@ -183,17 +192,18 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
       end
       next unless pushed
       
-      5.times do |fixup_iter|
+      10.times do |fixup_iter|
+        puts "#{iters_str}Build and fixup iteration #{fixup_iter}\n\n"
         # Try build
         b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
                               dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
         build_ok = b[:results].last[:exit_status] == 0
         
         if !build_ok
+          puts "#{iters_str}Build failed, trying to fixup the error, iteration #{fixup_iter}"
           error_context = extract_error_context(b)
           fixup_result = fixup_iteration(llmc, 0.3, repo, sha, error_context, "", 
-                                         llmc_fast, 768, 2048, 3)
-                                      
+                                         llmc_fast, 768, 2048, 1*iter)             
           if fixup_result[:success]
             # Commit fixup changes
             repo.index.write
@@ -206,9 +216,14 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
               update_ref: "HEAD"
             })
             repo.reset(commit_oid, :hard)
+            puts "#{iters_str}Fixup commit #{commit_oid} created\n\n"
             #reset_target = commit_oid
+          else
+            puts fixup_result[:message]
           end
         else
+          reset_target = result[:commited_as]
+          puts "#{iters_str}Build successful!"
           break
         end
       end

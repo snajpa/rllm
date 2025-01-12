@@ -21,46 +21,58 @@ end
 def save_slot(client, save_name)
   return 501 unless $caching_enabled
 
-  server_url = client.uri_base
-  uri = URI.parse(server_url + "/slots/0?action=save")
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.open_timeout = 30
-  http.read_timeout = 300
-  
-  request = Net::HTTP::Post.new(uri.request_uri, {'Content-Type' => 'application/json'})
-  request.body = { filename: save_name }.to_json
-  
-  response = http.request(request)
-  
-  if response.is_a?(Net::HTTPSuccess)
-    #puts "Slot saved successfully with name: #{save_name}"
-    response.code.to_i
-  else
-    #puts "Failed to save slot: #{response.code} - #{response.body}"
-    response.code.to_i
+  begin
+    server_url = client.uri_base
+    uri = URI.parse(server_url + "/slots/0?action=save")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.open_timeout = 30
+    http.read_timeout = 300
+    
+    request = Net::HTTP::Post.new(uri.request_uri, {'Content-Type' => 'application/json'})
+    request.body = { filename: save_name }.to_json
+    
+    response = http.request(request)
+    
+    if response.is_a?(Net::HTTPSuccess)
+      #puts "Slot saved successfully with name: #{save_name}"
+      response.code.to_i
+    else
+      #puts "Failed to save slot: #{response.code} - #{response.body}"
+      response.code.to_i
+    end
+  rescue => e
+    #puts "Failed to save slot: #{e.message}"
+    #puts e.backtrace
+    500
   end
 end
 
 def restore_slot(client, save_name)
   return 501 unless $caching_enabled
 
-  server_url = client.uri_base
-  uri = URI.parse(server_url + "/slots/0?action=restore")
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.open_timeout = 30
-  http.read_timeout = 30
-  
-  request = Net::HTTP::Post.new(uri.request_uri, {'Content-Type' => 'application/json'})
-  request.body = { filename: save_name }.to_json
-  
-  response = http.request(request)
-  
-  if response.is_a?(Net::HTTPSuccess)
-    #puts "Slot restored successfully with name: #{save_name}"
-    response.code.to_i
-  else
-    #puts "Failed to restore slot: #{response.code} - #{response.body}"
-    response.code.to_i
+  begin
+    server_url = client.uri_base
+    uri = URI.parse(server_url + "/slots/0?action=restore")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.open_timeout = 30
+    http.read_timeout = 60
+    
+    request = Net::HTTP::Post.new(uri.request_uri, {'Content-Type' => 'application/json'})
+    request.body = { filename: save_name }.to_json
+    
+    response = http.request(request)
+    
+    if response.is_a?(Net::HTTPSuccess)
+      #puts "Slot restored successfully with name: #{save_name}"
+      response.code.to_i
+    else
+      #puts "Failed to restore slot: #{response.code} - #{response.body}"
+      response.code.to_i
+    end
+  rescue => e
+    #puts "Failed to restore slot: #{e.message}"
+    #puts e.backtrace
+    500
   end
 end
 

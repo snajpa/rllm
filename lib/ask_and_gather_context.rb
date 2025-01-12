@@ -20,14 +20,14 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
 
     Now is your last chance to ask for further context! If you need more information to resolve the task at hand, please ask for it now.
 
-    When you're done, please type ASK: close to finish asking for context.
+    When you're done, please type ASK: close to finish the session.
 
     The format is an ask per line, per line format is ASK: <tool> <parameter1> [<parameter2> ...]. Available tools are:
     - Grep with context:
       - Syntax:
-          ASK: grep-context-n <pattern> <relative_path_or_glob_pattern1> [<relative_path_or_glob_pattern2> ...]
-      - Description: grep recursively for a pattern in path or glob pattern - use relative paths, either a files or directories, . for the whole repo
-      - Mandatory parameters: pattern, relative_path_or_glob_pattern1
+          ASK: grep-context-n <pattern> <relative_path_or_glob_path1> [<relative_path_or_glob_path2> ...]
+      - Description: grep recursively for a pattern in path or glob path - use relative paths, either a files or directories, . for the whole repo
+      - Mandatory parameters: pattern, relative_path_or_glob_path1
     - Cat with context:
       - Syntax:
           ASK: cat-context <line_number> <relative_path>      
@@ -46,14 +46,20 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
     The ask should be in this format:
     ASK: <tool> <parameter1> [<parameter2> ...]
 
-    When you have sufficient context, type ASK: close to finish asking for context.
+    When you have sufficient context, type ASK: close to finish the session.
 
-    Gather the most relevant information to the task at hand by giving asks that are specific and focused rather than broad and general.
+    Analyze the content before the divider line to understand the context of the task at hand.
+
+    If there is a code block for you to edit, gather all the relevant information for the edit. Make sure you have context for all the lines to be edited.
+    If there is a bug to be fixed, gather all the relevant information to the bug at hand. Make sure you have context for all the lines to be fixed.
+    If there is a task to be performed, gather all the relevant information to the task at hand. Make sure you have context for all the lines to be affected.
+
+    Gather all the relevant information to the task at hand by giving asks that are specific and focused rather than broad and general.
 
     PROMPT
 
     warmup_kv_cache_common_prompt(llmc, prompt_common + prompt_reask)
-    
+
     if ask_block.empty?
       prompt_reask += <<~PROMPT
       
@@ -68,7 +74,7 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
       1 hello world
       ```
       
-      BUDGET_LEFT: 10 lines and 3 asks
+      BUDGET_LEFT: 100 lines and 10 asks
       
       ASK: close
       RESULT:
