@@ -20,7 +20,7 @@ require_relative './lib/run_ssh_commands'
 require_relative './lib/utils'
 
 # Configuration
-# cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_F16=true -DGGML_CUDA_PEER_MAX_BATCH_SIZE=256 -DGGML_CUDA_FA_ALL_QUANTS=true
+# cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_F16=true -DGGML_CUDA_PEER_MAX_BATCH_SIZE=64 -DGGML_CUDA_FA_ALL_QUANTS=true
 # CUDA_VISIBLE_DEVICES="1" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/granite-3.1-8b-instruct.Q8_0.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8080 -fa -ctk q4_0 -ctv q4_0 --slot-save-path ~/tmp/llama-cache/
 # CUDA_VISIBLE_DEVICES="0,1,2" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8081 -fa -ctk q4_0 -ctv q4_0 -ts 20,4,20 -mg 1 -ub 512 -b 4096 --slot-save-path ~/tmp/llama-cache/
 # Nhrs=6; find ~/tmp/llama-cache/ -type f -amin +$(($Nhrs * 60)) -exec rm {} \;
@@ -164,7 +164,7 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
 
       # Try merge iteration
       result = merge_iteration(llmc, 0.8, repo, reset_target, dst_branch_name, src_sha, sha, llmc_fast,
-                               768, 2048, 25*iter, results[sha], error_context)
+                               8192, 8192, 25*iter, results[sha], error_context)
       results[sha] = result if result[:resolved]
       #next unless result[:resolved]
 

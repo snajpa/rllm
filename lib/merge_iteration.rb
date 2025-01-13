@@ -225,9 +225,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
 
       And finally and most importantly, this is the code block with the merge conflict you need to resolve:
 
-
-      In file #{path} on lines from #{first_block_start} to #{first_block_end}
-
+      In file #{path} on lines from #{first_block_start} to #{first_block_end}:
       There is a merge conflict in the following code block:
       ```
       #{conflicted_block}
@@ -235,16 +233,16 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
 
       PROMPT
 
-      background_warmup = Thread.new do
+      #background_warmup = Thread.new do
         warmup_kv_cache_common_prompt(llmc, prompt_common_warmup)
-      end
+      #end
 
       puts "Gathering additional context for block in #{path} on line #{first_block_start}:"
       asked_block = ask_and_gather_context(repo, reask_llmc, temperature, prompt_common,
                                           reask_perask_lines, reask_valid_lines, reask_iter_limit)
       #puts "Asked block: #{asked_block}"
 
-      background_warmup.join
+      #background_warmup.join
 
       prompt_mergeblock = <<~PROMPT
 
@@ -257,9 +255,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       ```
       #{conflicted_block}```
 
-      You can now start resolving the conflict. Provide fully integrated, correctly resolved merged code block below.
-
-      ================================
+      You can now start resolving the conflict. Provide fully integrated, correctly resolved merged code block, according to the Instructions, down below:
 
       Merged code block:
 
@@ -309,103 +305,100 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
           solution = line + "\n" + solution
         end
       end
+      solution_array = solution.split("\n")
+      solution_numbered_hash = {}
+      solution_array.each_with_index do |line, index|
+        if line =~ /^\s{0,5}(\d{1,6}) (.*)$/
+          solution_numbered_hash[$1.to_i-1] = $2
+          solution_numbered_hash[$1.to_i-1] ||= ""
+        end
+      end
+      solution_numbered_hash = solution_numbered_hash.sort.to_h
+      solution_start = solution_numbered_hash.keys.min
+      solution_end = solution_numbered_hash.keys.max
+    
+      if solution_numbered_hash.empty? || !(solution_start <= first_block_end && first_block_start <= solution_end)
+        puts "Failed - solution does not overlap with merge block"
+        next
+      end
+  
 
-      if solution
-        solution_array = solution.split("\n")
-        solution_numbered_hash = {}
-      
-        solution_array.each_with_index do |line, index|
-          if line =~ /^(\s{0,5}\d{1,6}) (.*)$/
-            solution_numbered_hash[$1.to_i-1] = $2
-            solution_numbered_hash[$1.to_i-1] ||= ""
-          end
+      error = false
+      solution_end.downto(solution_start) do |line_number|
+        if !solution_numbered_hash.has_key?(line_number)
+          puts "Missing line #{line_number}"
+          error = true
         end
-        solution_start = solution_numbered_hash.keys.min
-        solution_end = solution_numbered_hash.keys.max
-      
-        if solution_start != first_block_start
-          puts "Solution start (#{solution_start}) does not match first block start (#{first_block_start})"
-          porting_step[:reason] = :solution_start_mismatch
-          next
-        end
+      end
+      if error
+        porting_step[:reason] = :solution_missing_lines
+        next
+      end
 
-        error = false
-        solution_end.downto(solution_start) do |line_number|
-          if !solution_numbered_hash.has_key?(line_number)
-            puts "Missing line #{line_number}"
-            error = true
-          end
-        end
-        if error
-          porting_step[:reason] = :solution_missing_lines
-          next
-        end
+      new_content = []
 
-        new_content = []
-
-        # Arrive at solution
-        file_array.each_with_index do |line, index|
-          if index < first_block_start
-            new_content << line
-          end
-        end
-        # Fill in solution
-        solution_numbered_hash.each do |line_number, line|
+      # Arrive at solution
+      file_array.each_with_index do |line, index|
+        if index < first_block_start
           new_content << line
         end
-        # Fill in rest of file
-        file_array.each_with_index do |line, index|
-          if index > first_block_end
-            new_content << line
-          end
+      end
+      # Fill in solution
+      solution_numbered_hash.each do |line_number, line|
+        new_content << line
+      end
+      # Fill in rest of file
+      file_array.each_with_index do |line, index|
+        if index > first_block_end-1
+          new_content << line
         end
-        # Write resolved file
-        temp_path = "#{full_path}.tmp"
-        begin
-          File.open(temp_path, 'w') { |f| f.write(new_content.join("\n") + "\n") }
-          FileUtils.mv(temp_path, full_path)
-        rescue => e
-          FileUtils.rm(temp_path) if File.exist?(temp_path)
-          raise e
-        end
+      end
+      # Write resolved file
+      temp_path = "#{full_path}.tmp"
+      begin
+        File.open(temp_path, 'w') { |f| f.write(new_content.join("\n") + "\n") }
+        FileUtils.mv(temp_path, full_path)
+      rescue => e
+        FileUtils.rm(temp_path) if File.exist?(temp_path)
+        raise e
+      end
 
-        pending_merge_blocks -= 1
-        ported = true
-        step = {
-          sha: sha,
-          path: path,
-          mergeblock: conflicted_block,
-          mergeblock_start: first_block_start,
-          mergeblock_end: first_block_end,
-          solution: solution
-        }
-        porting_step[:resolved_mergeblocks] << step
+      pending_merge_blocks -= 1
+      ported = true
+      step = {
+        sha: sha,
+        path: path,
+        mergeblock: conflicted_block,
+        mergeblock_start: first_block_start,
+        mergeblock_end: first_block_end,
+        solution: solution
+      }
+      porting_step[:resolved_mergeblocks] << step
 
 
-        # Stage resolved file and mark as resolved
-        current_full_mode = repo.head.target.tree.path(path)[:filemode]
-        repo.index.add(path: path, oid: Rugged::Blob.from_workdir(repo, path), mode: current_full_mode)
-        if pending_merge_blocks > 0
-          next
-        else
-          repo.index.conflict_remove(path)
-          repo.index.write
-        end
+      # Stage resolved file and mark as resolved
+      current_full_mode = repo.head.target.tree.path(path)[:filemode]
+      repo.index.add(path: path, oid: Rugged::Blob.from_workdir(repo, path), mode: current_full_mode)
+      if pending_merge_blocks > 0
+        next
+      else
+        repo.index.conflict_remove(path)
+        repo.index.write
+      end
 
-        # Verify index is clean before creating tree
-        if !repo.index.conflicts?
-          commit_oid = Rugged::Commit.create(repo, {
-            tree: repo.index.write_tree(repo),
-            author: commit.author,
-            committer: commit.committer,
-            message: "[rllm-ported] " + commit.message + "\nPorted-by: rllm\n",
-            parents: [repo.head.target],
-            update_ref: 'HEAD'
-          })
-          repo.reset(commit_oid, :hard)
-          puts "Commited as #{commit_oid}"
-          reset_target = repo.lookup(commit_oid).oid
-        end
+      # Verify index is clean before creating tree
+      if !repo.index.conflicts?
+        commit_oid = Rugged::Commit.create(repo, {
+          tree: repo.index.write_tree(repo),
+          author: commit.author,
+          committer: commit.committer,
+          message: "[rllm-ported] " + commit.message + "\nPorted-by: rllm\n",
+          parents: [repo.head.target],
+          update_ref: 'HEAD'
+        })
+        repo.reset(commit_oid, :hard)
+        puts "Commited as #{commit_oid}"
+        reset_target = repo.lookup(commit_oid).oid
       end
       unless porting_step.empty?
         porting_steps << porting_step

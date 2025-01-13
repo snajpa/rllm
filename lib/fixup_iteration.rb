@@ -1,8 +1,8 @@
 def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, reask_llmc, reask_perask_lines, reask_valid_lines, reask_iter_limit)
   # Strip ANSI codes, parse errors (keep existing code)
   ansi_regex = /\x1b(?:[@-Z\\-_]|\[[0-?]*[ -\/]*[@-~]|\][^@\x07]*[@\x07]|\x7f)/
-  error_lines = build_output.split("\n").map { |l| l.gsub(ansi_regex, "") }
   build_output = build_output.force_encoding('UTF-8')
+  error_lines = build_output.split("\n").map { |l| l.gsub(ansi_regex, "") }
   parsed_error_lines = []
   error_files = []
 
@@ -80,39 +80,16 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
   )
 
   # Second pass - get edit locations with context
-  edit_suggestions_prompt_common = <<~PROMPT
+  edit_suggestions_prompt = <<~PROMPT
   You are tasked to fix build errors after a failed merge attempt.
 
-  PROMPT
-
-  warmup_kv_cache_common_prompt(llmc, edit_suggestions_prompt_common)
-
-  edit_suggestions_prompt = edit_suggestions_prompt_common + <<~PROMPT
-  Given these build errors and context:
+  Given these build errors:
 
   Errors:
   #{parsed_error_lines.map { |e| "#{e[:file]}:#{e[:line]}:#{e[:column]}: #{e[:message]}" }.join("\n")}
 
   Additional context gathered for your consideration:
   #{ask_block}
-
-  PROMPT
-
-  #if !last_patch_str_numbered.empty?
-  #  edit_suggestions_prompt += <<~PROMPT
-  #
-  #  Note: This is a next iteration of the fixup process on top of new merge results.
-#
-  #  During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
-  #  
-  #  ```
-  #  #{last_patch_str_numbered}
-  #  ```
-#
-  #  PROMPT
-  #end
-
-  edit_suggestions_prompt += <<~PROMPT
   
   Please specify which files and line ranges you need to edit to fix these issues.
   
@@ -132,7 +109,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
 
   Each EDIT suggestion line must start with "EDIT:" and contain the relative path to the file, the line number or range of lines to edit, and the rationale for the edit.
 
-  You can only specify one range per file. If you need to edit multiple ranges in the same file, please specify them separately.
+  You can only specify one range per file. If you need to edit multiple ranges in the same file, just enlarge the range to include all lines you need to edit.
 
   Your response will be used to guide the editing process for each individual file location.
 
@@ -143,6 +120,8 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
   Your response:
 
   PROMPT
+
+  warmup_kv_cache_common_prompt(llmc, edit_suggestions_prompt)
 
   edit_suggestions = []
   edit_suggestions_response = ""
@@ -205,7 +184,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     file = file[2..-1] if file.start_with?("./")
 
     p location
-    
+
     file_path = File.join(repo.workdir, file)
     next unless File.exist?(file_path)
 
@@ -253,6 +232,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     blamed_commit_oid = ""
     blamed_commit_msg_first_line = ""
     blamed_commit_str_numbered = "<not available>"
+    blamed_commit = nil
     begin
       full_path = File.join(repo.workdir, file)
       blame_line = `cd #{repo.workdir}; git blame -l -L #{location[:start_line]},#{location[:start_line]} #{file}`.split("\n")
@@ -265,14 +245,12 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
       #if blamed_commit_oid == first_commit_in_repo_oid
         blamed_commit_oid = ""
         blamed_commit_str_numbered = "<first commit in repository, too large to display>"
+        puts "Blamed commit: #{blamed_commit_oid}"
+        blamed_commit = repo.lookup(blamed_commit_oid)
       end
     rescue => e
-      puts "Failed to get blamed commit for #{file}:#{location[:start_line]}: #{e.message}"
-      puts e.backtrace
-    end
-    puts "Blamed commit: #{blamed_commit_oid}"
-    unless blamed_commit_oid.nil? || blamed_commit_oid.empty?
-      blamed_commit = repo.lookup(blamed_commit_oid)
+      #puts "Failed to get blamed commit for #{file}:#{location[:start_line]}: #{e.message}"
+      #puts e.backtrace
     end
     unless blamed_commit.nil?
       blamed_commit_msg_first_line = blamed_commit.message.split("\n").first
@@ -297,40 +275,13 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     end
     puts "Blamed commit str length: #{blamed_commit_str_numbered.split("\n").size}"
 
-    edit_prompt = <<~PROMPT
+    edit_prompt_cache = <<~PROMPT
     You are tasked to fix build errors after a failed merge attempt.
 
     These are the these build errors we have:
     ========================
     #{build_output}
     ========================
-
-    We have already picked what we're going to edit and why. Here are the overall edit suggestions:
-
-    #{edit_suggestions_response}
-    
-    We're solving the errors of #{file} now.
-    
-    We're editing lines #{location[:start_line] + 1}-#{location[:end_line] + 1}.
-
-    The rationale for this edit is: #{location[:rationale]}.
-
-    PROMPT
-
-    #if !last_patch_str_numbered.empty?
-    #  edit_prompt += <<~PROMPT
-    #
-    #  Note: This is a next iteration of the fixup process on top of new merge results.
-    #
-    #  During the previous merge iteration, we have tried to fix the errors and warnings of the previous build. In case you find it useful, here is the last patch that was applied:
-    #  
-    #  ```
-    #  #{last_patch_str_numbered}
-    #  ```  
-    #  PROMPT
-    #end
-
-    edit_prompt += <<~PROMPT
 
     Here is the additional context for this edit:
     #{ask_block}
@@ -342,6 +293,21 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     The original version of the commit before porting it onto this state of codebase is:
 
     #{blamed_commit_str_numbered}
+
+    We have already picked what we're going to edit and why. Here are the overall edit suggestions:
+
+    #{edit_suggestions_response}
+    
+    PROMPT
+
+    warmup_kv_cache_common_prompt(llmc, edit_prompt_cache)
+
+    edit_prompt = edit_prompt_cache + <<~PROMPT
+    We're solving the errors of #{file} now.
+    
+    We're editing lines #{location[:start_line] + 1}-#{location[:end_line] + 1}.
+
+    The original rationale for this edit: #{location[:rationale]}.
 
     And finally, here is the code block from #{file} for you to edit:
     ```
@@ -394,85 +360,84 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
       )
     end
 
-    # Extract code block from response 
     lines = response.split("\n").reverse
     solution = ""
     in_block = false
-    solution_numbered_hash = {}
-
     lines.each do |line|
       if line.start_with?("```")
         in_block = !in_block
       elsif in_block
-        # Parse numbered lines (e.g. "  123 code")
-        if line =~ /^(\s{0,5}\d{1,6}) (.*)$/
-          solution_numbered_hash[$1.to_i-1] = $2
-        else
-          solution = line + "\n" + solution
-        end
+        solution = line + "\n" + solution
+      end
+    end
+    solution_array = solution.split("\n")
+    solution_numbered_hash = {}
+    solution_array.each_with_index do |line, index|
+      if line =~ /^\s{0,5}(\d{1,6}) (.*)$/
+        solution_numbered_hash[$1.to_i-1] = $2
+        solution_numbered_hash[$1.to_i-1] ||= ""
       end
     end
     solution_numbered_hash = solution_numbered_hash.sort.to_h
+    solution_start = solution_numbered_hash.keys.min
+    solution_end = solution_numbered_hash.keys.max
     
-    if !solution_numbered_hash.empty?
-      solution_start = solution_numbered_hash.keys.min
-      solution_end = solution_numbered_hash.keys.max
+    if solution_numbered_hash.empty?
+      puts "Failed - solution empty, response was: \n#{response}"
+      redo
+    end
 
-      # Validate line numbers
-      if solution_start != location[:start_line]
-        return { success: false, message: "Failed - solution start line does not match requested line" }
-      end
-      error = false
-      #solution_end.downto(solution_start) do |line_number|
-      #  if !solution_numbered_hash.has_key?(line_number)
-      #    puts "Missing line #{line_number}"
-      #    error = true
-      #  end
-      #end
-      
-      #if error
-      #  puts "Failed - solution has missing line numbers"
-      #  next
-      #end
+    # Validate line numbers:
+    # Test overlap
+    p location
+    p solution_start
+    p solution_end
+    unless solution_start <= location[:end_line] && location[:start_line] <= solution_end
+      puts "Failed - solution does not overlap with location"
+      redo
+    end
+    
 
-      # Read current file content
-      file_path = File.join(repo.workdir, file)
-      file_content = File.read(file_path).split("\n")
 
-      # Generate new content
-      new_content = []
-      
-      # Add lines before fix
-      file_content.each_with_index do |line, index|
-        if index < solution_start
-          new_content << line
-        end
-      end
+    #if error
+    #  puts "Failed - solution has missing line numbers"
+    #  next
+    #end
 
-      # Add fixed lines
-      solution_numbered_hash.each do |line_number, line|
+    # Read current file content
+    file_path = File.join(repo.workdir, file)
+    file_content = File.read(file_path).split("\n")
+
+    # Generate new content
+    new_content = []
+    
+    # Add lines before fix
+    file_content.each_with_index do |line, index|
+      if index < solution_start
         new_content << line
       end
+    end
 
-      # Add remaining lines
-      file_content.each_with_index do |line, index|
-        if (index + 1) >= solution_end
-          new_content << line
-        end
-      end
+    # Add fixed lines
+    solution_numbered_hash.each do |line_number, line|
+      new_content << line
+    end
 
-      begin
-        File.open(file_path, 'w') { |f| f.write(new_content.join("\n") + "\n") }
-        repo.index.add(file)
-        puts "Successfully applied changes to #{file}"
-        true
-      rescue => e
-        puts "Failed to apply changes to #{file}: #{e.message}"
-        puts e.backtrace
-        redo
+    # Add remaining lines
+    file_content.each_with_index do |line, index|
+      if index > solution_end
+        new_content << line
       end
-    else
-      puts "Failed - no valid numbered lines found in solution"
+    end
+
+    begin
+      File.open(file_path, 'w') { |f| f.write(new_content.join("\n") + "\n") }
+      repo.index.add(file)
+      puts "Successfully applied changes to #{file}"
+      true
+    rescue => e
+      puts "Failed to apply changes to #{file}: #{e.message}"
+      puts e.backtrace
       redo
     end
   end
