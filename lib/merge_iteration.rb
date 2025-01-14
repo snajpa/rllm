@@ -394,7 +394,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       # Fill in rest of file
       file_array.each_with_index do |line, index|
         index += 1
-        if index > (solution_end + 3)
+        if index > solution_end
           new_content << line
         end
       end
