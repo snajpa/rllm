@@ -151,7 +151,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     edit_suggestions_response.split("\n").each do |line|
       # Match EDIT: relative_path_to_file:start_line-end_line # rationale for edit
       # or EDIT: relative_path_to_file:start_line # rationale for edit
-      if line =~ /^\s*\**\s*EDIT\s*\**:\s*([^:]+):(\d+(?:-\d+)?)\s*#\s*(.*)$/
+      if line =~ /^\s*\**\s*\**\s*EDIT\s*\**:\s*([^:]+):(\d+(?:-\d+)?)\s*#\s*(.*)$/
         file = $1.strip
         range = $2.strip
         rationale = $3.strip
@@ -374,8 +374,8 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     solution_numbered_hash = {}
     solution_array.each_with_index do |line, index|
       if line =~ /^\s{0,5}(\d{1,6}) (.*)$/
-        solution_numbered_hash[$1.to_i-1] = $2
-        solution_numbered_hash[$1.to_i-1] ||= ""
+        solution_numbered_hash[$1.to_i] = $2
+        solution_numbered_hash[$1.to_i] ||= ""
       end
     end
     solution_numbered_hash = solution_numbered_hash.sort.to_h
@@ -390,8 +390,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     # Validate line numbers:
     # Test overlap
     p location
-    p solution_start
-    p solution_end
+    puts "Solution start: #{solution_start}, end: #{solution_end}"
     unless solution_start <= location[:end_line] && location[:start_line] <= solution_end
       puts "Failed - solution does not overlap with location"
       redo
@@ -413,7 +412,8 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     
     # Add lines before fix
     file_content.each_with_index do |line, index|
-      if index < solution_start
+      index += 1
+      if index <= solution_start
         new_content << line
       end
     end
@@ -425,7 +425,8 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
 
     # Add remaining lines
     file_content.each_with_index do |line, index|
-      if index > solution_end
+      index += 1
+      if index > solution_end 
         new_content << line
       end
     end

@@ -175,8 +175,15 @@ def ask_and_gather_context(repo, llmc, temperature, prompt_common, max_perask_li
           pattern = ""
           break
         end
-        param = param[2..-1] if param.start_with?("./")
-        param = param[1..-1] if param.start_with?("/")
+        if param.start_with?("./")
+          param = param[2..-1] 
+        elsif param.start_with?("/")
+          param = param[1..-1]
+        elsif param.start_with?("a/")
+          param = param[2..-1]
+        elsif param.start_with?("b/")
+          param = param[2..-1]
+        end
         if File.exist?(File.join(repo.workdir, param))
           files << param
         elsif !Dir.glob(File.join(repo.workdir, param)).select { |file| File.directory?(file) }.empty?

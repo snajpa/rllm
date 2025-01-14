@@ -25,6 +25,7 @@ require_relative './lib/utils'
 # CUDA_VISIBLE_DEVICES="0,1,2" ~/tmp/llama.cpp/build-rpc-cuda/bin/llama-server --no-mmap -m ~/models/Llama-3.1-Nemotron-70B-Instruct-HF-IQ4_XS.gguf -ngl 99 -c 131072 -t 8 --host 0.0.0.0 --port 8081 -fa -ctk q4_0 -ctv q4_0 -ts 20,4,20 -mg 1 -ub 512 -b 4096 --slot-save-path ~/tmp/llama-cache/
 # Nhrs=6; find ~/tmp/llama-cache/ -type f -amin +$(($Nhrs * 60)) -exec rm {} \;
 
+$compile_last = true
 $caching_enabled = true
 
 LLAMA_API_ENDPOINT_GOOD_SLOW = 'http://localhost:8081'
@@ -35,16 +36,16 @@ options = {}
 
 repo_dir = '/home/snajpa/linux'
 
-src_sha = 'b62cef9a5c67' # random linux commit
+src_sha = 'c45323b7560e' # random linux commit
 #cherrypick_commit_range = '319addc2ad90..cf9971c0322e' # upto: tmpfs: use 1/2 of memcg limit if present v3
-cherrypick_commit_range = 'd3e69f8ab5df..c09b3eaeafd9' # syslog-ns
+#cherrypick_commit_range = 'd3e69f8ab5df..c09b3eaeafd9' # syslog-ns
 #src_sha = '0bc21e701a6f' # 6.13-rc5+
-#cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e' # full stack from 6.12.7
+cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e' # full stack from 6.12.7
 #src_sha = '8155b4ef3466' # next-20240104
 #cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68'
 
 dst_branch_name = 'vpsadminos-devel'
-dst_remote_name = 'origin'
+dst_remote_name = 'desktop'
 
 OpenAI.configure do |config|
   config.access_token = ""
@@ -75,7 +76,7 @@ end
 
 def ssh_build_iteration(ssh_host, ssh_user, ssh_options, quiet, dst_remote_name, dst_branch_name, dir, cores, &block)
   commands = [
-    { cmd: "cd #{dir}; git fetch", can_fail: false },
+    { cmd: "cd #{dir}; git fetch #{dst_remote_name}", can_fail: false },
     { cmd: "cd #{dir}; git checkout -f master", can_fail: false },
     { cmd: "cd #{dir}; git branch -D #{dst_branch_name}", can_fail: true },
     { cmd: "cd #{dir}; git reset --hard #{dst_remote_name}/#{dst_branch_name}", can_fail: true },
@@ -150,7 +151,7 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
       iter += 1
       commit_str = "#{sha[0..7]} - #{commit.message.split("\n").first}"
       iters_str = "\n#{iter}/#{max_iterations} iters, commit: #{n_commit}/#{n_commits} #{commit_str}: "
-      puts "#{iters_str} merging commit"
+      puts "#{iters_str}merging commit"
 
       # Setup initial branch state
       repo.reset(reset_target, :hard)
@@ -171,28 +172,29 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
       #reset_target = result[:reset_target]
 
       # Only do this if we're doing the last commit
-    #  unless n_commit == n_commits
-    #    #puts "#{iters_str}Skipping build for non-last commit"
-    #    reset_target = result[:commited_as]
-    #    build_ok = true
-    #    next
-    #  end
-      
-      unless result[:llm_ported]
-        # Validation not needed when LLM didn't touch the code
-        build_ok = true
+      if $compile_last && (n_commit != n_commits)
+        puts "Skipping build for non-last commit"
         reset_target = result[:commited_as]
+        build_ok = true
         next
+      else
+        if !result[:llm_ported] && (!$compile_last || n_commit != n_commits)
+          # Validation not needed when LLM didn't touch the code
+          puts "Skipping build for non-ported commit"
+          build_ok = true
+          reset_target = result[:commited_as]
+          next
+        end
       end
       
       # Try push
-      pushed = false
-      3.times do
-        f = force_push(repo.workdir, dst_remote_name, dst_branch_name)
-        pushed = f.exitstatus == 0
-        break if pushed
-      end
-      next unless pushed
+      #pushed = false
+      #3.times do
+      #  f = force_push(repo.workdir, dst_remote_name, dst_branch_name)
+      #  pushed = f.exitstatus == 0
+      #  break if pushed
+      #end
+      #next unless pushed
       
       15.times do |fixup_iter|
         puts "#{iters_str}Build and fixup iteration #{fixup_iter}\n\n"

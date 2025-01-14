@@ -157,62 +157,67 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
             end
           end unless porting_step[:resolved_mergeblocks].empty?
         end
+      end
+      error_prompt = ""
+      if !error_context.empty?
+        error_prompt += <<~CONTEXT
 
-        if !error_context.empty?
-          error_prompt = <<~CONTEXT
+        Following is the output of the build process from the your previous failed attempt:
 
-          Following is the output of the build process from the your previous failed attempt:
+        ```
+        #{error_context}
+        ```
 
-          ```
-          #{error_context}
-          ```
-
+        CONTEXT
+        if !previous_solution.empty?
+          error_prompt += <<~CONTEXT
           We also provide you with your previous attempt to merge the code in this file at this offset:
           ```
           #{previous_solution}
           ```
 
           CONTEXT
-        else
-          error_prompt = <<~CONTEXT
-
-          CONTEXT
         end
       end
 
       prompt_common_warmup = <<~PROMPT
+      # Resolving Git merge conflict
+      
       You are resolving a Git merge conflict.
 
       Carefully read these instructions, then the original commit and the code block with a conflict to be merged.
 
-      Task description:
+      # Task description:
       - Your task is to resolve the conflict in the code block by merging the code from the original commit and the code from the branch we're merging on top of.
 
-      Instructions:
-      - Resolving the merge conflict in the code block provided below the original commit.
+      # Instructions:
+      - First, select a range of lines from the original file that you want to replace, then provide a code block that will replace the selected range.
       - Be mindful of the full context.
       - Do only what is relevant for resolving the merge conflict.
       - Resolve conflicts in full spirit of the original commit.
       - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
       - If the commit rearranges or refactors code, ensure that the final code is refactored in the same way.
+      - If the code has been rearranged or refactored in the original state we're merging onto, ensure that the final code is refactored in the same way.
       - Correctly number the lines in the solved code block to match their new positions in the target file.
 
-      Constraints:
+      ## Constraints:
       - You are forbidden to insert any comments into the resolved merge code block itself.
 
-      This is the full commit we're now merging:
+      # Data:
+      
+      ## This is the full commit we're now merging:
 
       ```
       #{commit_details}
       ```
 
-      For reference, this is the state of the code the commit works on:
+      ## For reference, this commit works on top of the following code in this context:
 
       ```
       #{old_block}
       ```
 
-      Carefully mind the current state of code we're merging this commit onto:
+      ## This was the original code before we attempted to merge:
 
       ```
       #{original_block}
@@ -220,19 +225,22 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       PROMPT
 
       prompt_common = prompt_common_warmup + <<~PROMPT
-
       #{error_prompt}
 
-      And finally and most importantly, this is the code block with the merge conflict you need to resolve:
+      PROMPT
+      tmp = <<~PROMPT
+            
+      ## Merge conflict details:
 
       In file #{path} on lines from #{first_block_start} to #{first_block_end}:
+
       There is a merge conflict in the following code block:
+
       ```
       #{conflicted_block}
       ```
 
       PROMPT
-
       #background_warmup = Thread.new do
         warmup_kv_cache_common_prompt(llmc, prompt_common_warmup)
       #end
@@ -246,18 +254,51 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
 
       prompt_mergeblock = <<~PROMPT
 
-      Additional context for resolution of the merge conflict in file #{path} on lines from #{first_block_start} to #{first_block_end}:
+      ## Additional context for resolution of the merge conflict in file #{path} on lines from #{first_block_start} to #{first_block_end}:
 
       #{asked_block}
       
-      To recapitulate, this is the code block with the merge conflict you need to resolve, it is in file #{path} on lines from #{first_block_start} to #{first_block_end}:
+      ## Merge conflict details:
+      
+      Below is the code block with the merge conflict you need to resolve, it is in file #{path} on lines from #{first_block_start} to #{first_block_end}.
+
+      Code block with the conflict:
 
       ```
-      #{conflicted_block}```
+      #{conflicted_block}
+      ```
 
-      You can now start resolving the conflict. Provide fully integrated, correctly resolved merged code block, according to the Instructions, down below:
+      # Response instructions:
+      
+      - Read the context and the code block with the conflict.
+      - Resolve the conflict by providing a code block that will replace the selected range.
+      - Be mindful of the full context.
+      - Do only what is relevant for resolving the merge conflict.
+      - Resolve conflicts in full spirit of the original commit.
+      - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
+      - If the commit rearranges or refactors code, ensure that the final code is refactored in the same way.
+      - If the code has been rearranged or refactored in the original state we're merging onto, ensure that the final code is refactored in the same way.
+      - Correctly number the lines in the solved code block to match their new positions in the target file.
+      - Never insert any new comments into the resolved merge code block itself.
 
-      Merged code block:
+      ## Response example:
+      
+      ```
+      1 line 1
+      2 line 2
+      ```
+
+      The above example would replace lines 1 to 50 in the target file with the provided two lines.
+
+      You can provide a solution in the following format:
+
+      ```
+      line_number line_content
+      [[line_number line_content]
+      ...]
+      ```
+
+      # Response: 
 
       PROMPT
   
@@ -266,7 +307,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
 
       #puts prompt_common
       #puts prompt_mergeblock
-      #puts conflicted_block
+      puts conflicted_block
       
       puts "LLM response:"
       porting_step[:prompt] = prompt_mergeblock
@@ -309,14 +350,16 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       solution_numbered_hash = {}
       solution_array.each_with_index do |line, index|
         if line =~ /^\s{0,5}(\d{1,6}) (.*)$/
-          solution_numbered_hash[$1.to_i-1] = $2
-          solution_numbered_hash[$1.to_i-1] ||= ""
+          solution_numbered_hash[$1.to_i] = $2
+          solution_numbered_hash[$1.to_i] ||= ""
         end
       end
       solution_numbered_hash = solution_numbered_hash.sort.to_h
       solution_start = solution_numbered_hash.keys.min
       solution_end = solution_numbered_hash.keys.max
     
+      puts "Solution start: #{solution_start}, end: #{solution_end}"
+
       if solution_numbered_hash.empty? || !(solution_start <= first_block_end && first_block_start <= solution_end)
         puts "Failed - solution does not overlap with merge block"
         next
@@ -339,7 +382,8 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
 
       # Arrive at solution
       file_array.each_with_index do |line, index|
-        if index < first_block_start
+        index += 1
+        if index < solution_start
           new_content << line
         end
       end
@@ -349,7 +393,8 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       end
       # Fill in rest of file
       file_array.each_with_index do |line, index|
-        if index > first_block_end-1
+        index += 1
+        if index > (solution_end + 3)
           new_content << line
         end
       end
