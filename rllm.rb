@@ -164,7 +164,7 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
       repo.checkout("refs/heads/#{dst_branch_name}")
 
       # Try merge iteration
-      result = merge_iteration(llmc, 0.8, repo, reset_target, dst_branch_name, src_sha, sha, llmc_fast,
+      result = merge_iteration(llmc, 0.4, repo, reset_target, dst_branch_name, src_sha, sha, llmc_fast,
                                8192, 8192, 25*iter, results[sha], error_context)
       results[sha] = result if result[:resolved]
       #next unless result[:resolved]

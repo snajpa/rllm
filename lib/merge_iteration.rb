@@ -66,8 +66,8 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
 
       puts "Pending merge blocks: #{pending_merge_blocks}"
 
-      context_lines_after = 8
-      context_lines_before = 8
+      context_lines_after = 5
+      context_lines_before = 5
       
       first_block = labeled_lines.select { |k, v| v[:merge_id] == 0 }
 
@@ -82,11 +82,12 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
         porting_step[:reason] = :no_merge_blocks
         next
       end
-
-      first_block_start = [0, first_block.keys.min - context_lines_before].max
-      first_block_end = [file_array.size - 1, first_block.keys.max + context_lines_after].min
-      porting_step[:first_block_start] = first_block_start
-      porting_step[:first_block_end] = first_block_end
+      first_block_start = first_block.keys.min
+      first_block_end = first_block.keys.max
+      first_block_wctx_start = [0, first_block_start - context_lines_before].max
+      first_block_wctx_end = [file_array.size - 1, first_block_end + context_lines_after].min
+      porting_step[:first_block_wctx_start] = first_block_wctx_start
+      porting_step[:first_block_wctx_end] = first_block_wctx_end
 
       original_block = ""
       # Get the file content from the immediate parent commit
@@ -104,7 +105,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
         parent_content_array = parent_content.split("\n")
         max_digits = parent_content_array.size.to_s.length
         parent_content_array.each_with_index do |line, index|
-          if index >= first_block_start && index <= first_block_end
+          if index >= first_block_start && index <= first_block_start
             original_block += "%#{max_digits}d %s\n" % [index+1, line]
           end
         end
@@ -118,7 +119,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
         old_content_array = old_content.split("\n")
         max_digits = old_content_array.size.to_s.length
         old_content_array.each_with_index do |line, index|
-          if index >= first_block_start && index <= first_block_end
+          if index >= first_block_start && index <= first_block_start
             old_block += "%#{max_digits}d %s\n" % [index+1, line]
           end
         end
@@ -126,8 +127,8 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
 
       conflicted_block = ""
       file_array.each_with_index do |line, index|
-        max_digits = first_block_end.to_s.length
-        if index >= first_block_start && index <= first_block_end
+        max_digits = first_block_wctx_end.to_s.length
+        if index >= first_block_wctx_start && index <= first_block_wctx_end
           conflicted_block += "%#{max_digits}d %s\n" % [index+1, line]
         end
       end
@@ -151,8 +152,8 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
           porting_step[:resolved_mergeblocks].each_with_index do |mergeblock, index|
             if mergeblock[:sha] == sha && \
               mergeblock[:path] == path && \
-              mergeblock[:mergeblock_start] == first_block_start && \
-              mergeblock[:mergeblock_end] == first_block_end
+              mergeblock[:mergeblock_start] == first_block_wctx_start && \
+              mergeblock[:mergeblock_end] == first_block_wctx_end
               previous_solution = mergeblock[:solution]
             end
           end unless porting_step[:resolved_mergeblocks].empty?
@@ -185,43 +186,52 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       
       You are resolving a Git merge conflict.
 
-      Carefully read these instructions, then the original commit and the code block with a conflict to be merged.
+      Carefully read these instructions, then the patch and the codeblock with a conflict to be merged.
 
       # Task description:
-      - Your task is to resolve the conflict in the code block by merging the code from the original commit and the code from the branch we're merging on top of.
+      - Your task is to resolve the conflict in the codeblock by merging the code from the patch and the code from the branch we're merging on top of.
 
       # Instructions:
-      - First, select a range of lines from the original file that you want to replace, then provide a code block that will replace the selected range.
+      - Provide a re
       - Be mindful of the full context.
       - Do only what is relevant for resolving the merge conflict.
-      - Resolve conflicts in full spirit of the original commit.
-      - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
-      - If the commit rearranges or refactors code, ensure that the final code is refactored in the same way.
+      - Resolve conflicts in full spirit of the patch.
+      - If the patch introduces a new feature, ensure that the feature is preserved in the final code.
+      - If the patch rearranges or refactors code, ensure that the final code is refactored in the same way.
       - If the code has been rearranged or refactored in the original state we're merging onto, ensure that the final code is refactored in the same way.
-      - Correctly number the lines in the solved code block to match their new positions in the target file.
+      - Correctly number the lines in the solved codeblock to match their new positions in the target file.
 
       ## Constraints:
-      - You are forbidden to insert any comments into the resolved merge code block itself.
+      - You are forbidden to insert your commentary into the resolved merge codeblock itself.
 
       # Data:
       
-      ## This is the full commit we're now merging:
+      ## This is the full patch we're now merging:
 
       ```
       #{commit_details}
       ```
 
-      ## For reference, this commit works on top of the following code in this context:
+      ## Old code on top of which the patch was originally introduced:
 
+      This is the state of the code which the patch was originally applied to:
+      
       ```
       #{old_block}
       ```
 
-      ## This was the original code before we attempted to merge:
+      It is provided to you for reference only, so you can understand the context of the changes in the patch.
+
+      ## Current code before the merge attempt:
+
+      This was the state of the code just before the merge attempt, the current codeblock:
 
       ```
       #{original_block}
       ```
+
+      Be sure to port only the actual intended changes from the patch, onto this current codeblock.
+
       PROMPT
 
       prompt_common = prompt_common_warmup + <<~PROMPT
@@ -230,11 +240,11 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       PROMPT
       tmp = <<~PROMPT
             
-      ## Merge conflict details:
+      ## Merge conflict codeblock
 
-      In file #{path} on lines from #{first_block_start} to #{first_block_end}:
-
-      There is a merge conflict in the following code block:
+      After we attempted to merge the code, we encountered a conflict in the codeblock in file #{path} on lines from #{first_block_wctx_start} to #{first_block_wctx_end}.
+      
+      This is the merge conflict codeblock:
 
       ```
       #{conflicted_block}
@@ -245,7 +255,7 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
         warmup_kv_cache_common_prompt(llmc, prompt_common_warmup)
       #end
 
-      puts "Gathering additional context for block in #{path} on line #{first_block_start}:"
+      puts "Gathering additional context for block in #{path} on line #{first_block_wctx_start}:"
       asked_block = ask_and_gather_context(repo, reask_llmc, temperature, prompt_common,
                                           reask_perask_lines, reask_valid_lines, reask_iter_limit)
       #puts "Asked block: #{asked_block}"
@@ -254,56 +264,36 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
 
       prompt_mergeblock = <<~PROMPT
 
-      ## Additional context for resolution of the merge conflict in file #{path} on lines from #{first_block_start} to #{first_block_end}:
+      ## Additional context
+      
+      Additional context was gathered for resolution of the merge conflict in file #{path} on lines from #{first_block_wctx_start} to #{first_block_wctx_end}:
 
       #{asked_block}
       
-      ## Merge conflict details:
+      It might help you to resolve the conflict.
       
-      Below is the code block with the merge conflict you need to resolve, it is in file #{path} on lines from #{first_block_start} to #{first_block_end}.
-
-      Code block with the conflict:
-
-      ```
-      #{conflicted_block}
-      ```
-
       # Response instructions:
       
-      - Read the context and the code block with the conflict.
-      - Resolve the conflict by providing a code block that will replace the selected range.
-      - Be mindful of the full context.
+      - Read all the provided context and the codeblock with the conflict.
+      - Resolve the conflict by providing the codeblock that merges the code from the patch and the code from the branch we're merging on top of.
       - Do only what is relevant for resolving the merge conflict.
-      - Resolve conflicts in full spirit of the original commit.
-      - If the commit introduces a new feature, ensure that the feature is preserved in the final code.
-      - If the commit rearranges or refactors code, ensure that the final code is refactored in the same way.
+      - If the patch introduces a new feature, ensure that the feature is preserved in the final code.
+      - If the patch rearranges or refactors code, ensure that the final code is refactored in the same way.
       - If the code has been rearranged or refactored in the original state we're merging onto, ensure that the final code is refactored in the same way.
-      - Correctly number the lines in the solved code block to match their new positions in the target file.
-      - Never insert any new comments into the resolved merge code block itself.
+      - Correctly number the lines in the solved codeblock to match their new positions in the target file.
+      - Never insert your comments into the resolved merge codeblock.
+      - Make sure you cite enough context around the resolution to make its position clear.
 
-      ## Response example:
+      # Query:
       
-      ```
-      1 line 1
-      2 line 2
-      ```
+      Please resolve the conflict in the merge conflict codeblock above by carefully correctly merging the code from the patch and the current code in the file.
 
-      The above example would replace lines 1 to 50 in the target file with the provided two lines.
-
-      You can provide a solution in the following format:
-
-      ```
-      line_number line_content
-      [[line_number line_content]
-      ...]
-      ```
-
-      # Response: 
+      Fully integrated resolved merge block:
 
       PROMPT
   
       puts "Resolving conflict in #{path}:"
-      puts "Code block start: #{first_block_start+1}, end: #{first_block_end+1}"
+      puts "Code block start: #{first_block_wctx_start+1}, end: #{first_block_wctx_end+1}"
 
       #puts prompt_common
       #puts prompt_mergeblock
@@ -360,48 +350,104 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
     
       puts "Solution start: #{solution_start}, end: #{solution_end}"
 
-      if solution_numbered_hash.empty? || !(solution_start <= first_block_end && first_block_start <= solution_end)
+      if solution_numbered_hash.empty? || !(solution_start <= first_block_wctx_end && first_block_wctx_start <= solution_end)
         puts "Failed - solution does not overlap with merge block"
         next
       end
   
+      # Convert to unnumbered string
+      solution = solution_numbered_hash.values.join("\n") + "\n"
 
-      error = false
-      solution_end.downto(solution_start) do |line_number|
-        if !solution_numbered_hash.has_key?(line_number)
-          puts "Missing line #{line_number}"
-          error = true
-        end
-      end
-      if error
-        porting_step[:reason] = :solution_missing_lines
-        next
+      # Get the original lines as a string for character-based diff
+      original_block_str = file_array[first_block_wctx_start-1..first_block_wctx_end-1].join("\n") + "\n"
+
+      # Find common prefix length
+      common_prefix_length = 0
+      index = nil
+      [original_block_str.length, solution.length].min.times do |i|
+        index = original_block_str.index(solution[0..i])
+        break if index.nil?
+        common_prefix_length = index
       end
 
-      new_content = []
+      if index.nil? # No common prefix
+        # So we need to use the offset of the start of the first line of the solution in solution_start
+        offset = 0
+        file_array.each_with_index do |line, index|
+          if index+1 == solution_start
+            break
+          end
+          offset += line.length + 1
+        end
+        file_offset_start = offset
+      else
+        # Find common suffix length by working backwards
+        common_suffix_length = 1
+        max_suffix_length = [original_block_str.length - common_prefix_length, solution.length - common_prefix_length].max
+        max_suffix_length.times do |i|
+          to_find = solution[-i - 1]
+          break if to_find.nil?
+          index = original_block_str.index(to_find)
+          p index
+          break if index.nil?
+          common_suffix_length = index
+        end
 
-      # Arrive at solution
-      file_array.each_with_index do |line, index|
-        index += 1
-        if index < solution_start
-          new_content << line
-        end
+        # Calculate file offsets
+        file_offset_start = file_content.index(original_block_str)
+        raise "Could not find original block in file" unless file_offset_start
       end
-      # Fill in solution
-      solution_numbered_hash.each do |line_number, line|
-        new_content << line
-      end
-      # Fill in rest of file
-      file_array.each_with_index do |line, index|
-        index += 1
-        if index > solution_end
-          new_content << line
-        end
-      end
+      # Replace the differing middle part
+      middle_start = file_offset_start + common_prefix_length
+      middle_length = original_block_str.length - common_prefix_length - common_suffix_length
+      solution_middle = solution[common_prefix_length...-common_suffix_length]
+
+      puts "Middle start: #{middle_start}, length: #{middle_length}"
+      puts "Common prefix length: #{common_prefix_length}, common suffix length: #{common_suffix_length}"
+
+      new_content = file_content[0...middle_start] + solution_middle + file_content[file_offset_start + original_block_str.length - common_suffix_length..-1]
+
+      # Old code
+      
+
+      #error = false
+      #solution_end.downto(solution_start) do |line_number|
+      #  if !solution_numbered_hash.has_key?(line_number)
+      #    puts "Missing line #{line_number}"
+      #    error = true
+      #  end
+      #end
+      #if error
+      #  porting_step[:reason] = :solution_missing_lines
+      #  next
+      #end
+
+      #new_content = []
+      #
+      ## Arrive at solution
+      #file_array.each_with_index do |line, index|
+      #  index += 1
+      #  before = [solution_start, first_block_wctx_start].min
+      #  if index < before
+      #    new_content << line
+      #  end
+      #end
+      ## Fill in solution
+      #solution_numbered_hash.each do |line_number, line|
+      #  new_content << line
+      #end
+      ## Fill in rest of file
+      #file_array.each_with_index do |line, index|
+      #  index += 1
+      #  after = [solution_end, first_block_wctx_end].max
+      #  if index > after
+      #    new_content << line
+      #  end
+      #end
       # Write resolved file
       temp_path = "#{full_path}.tmp"
       begin
-        File.open(temp_path, 'w') { |f| f.write(new_content.join("\n") + "\n") }
+        File.open(temp_path, 'w') { |f| f.write(new_content) }
         FileUtils.mv(temp_path, full_path)
       rescue => e
         FileUtils.rm(temp_path) if File.exist?(temp_path)
@@ -414,8 +460,8 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
         sha: sha,
         path: path,
         mergeblock: conflicted_block,
-        mergeblock_start: first_block_start,
-        mergeblock_end: first_block_end,
+        mergeblock_start: first_block_wctx_start,
+        mergeblock_end: first_block_wctx_end,
         solution: solution
       }
       porting_step[:resolved_mergeblocks] << step
