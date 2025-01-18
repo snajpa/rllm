@@ -1,4 +1,4 @@
-def merge_iteration(ui, llmc, temperature, repo, reset_target, dst_branch_name, src_sha, sha, reask_llmc, reask_perask_lines, reask_valid_lines, reask_iter_limit, prev_result, error_context)
+def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_sha, sha, reask_llmc, reask_perask_lines, reask_valid_lines, reask_iter_limit, prev_result, error_context)
   # Remove commit_list loop and keep the core conflict resolution logic
   merge_result = { llm_ported: false, resolved: false, commited_as: nil, reset_target: reset_target, porting_steps: [] }
   
@@ -75,7 +75,7 @@ def merge_iteration(ui, llmc, temperature, repo, reset_target, dst_branch_name, 
       porting_step[:pending_merge_blocks] = pending_merge_blocks
 
       if first_block.empty?
-        puts "No merge blocks found in #{path}, possibly file is deleted, staging anyway"
+        $stderr.puts "No merge blocks found in #{path}, possibly file is deleted, staging anyway"
         exit # TODO: think about this
         File.unlink(full_path) rescue nil
         repo.index.remove(path) rescue nil
@@ -354,18 +354,44 @@ def merge_iteration(ui, llmc, temperature, repo, reset_target, dst_branch_name, 
           max_tokens: 256,
           #grammar: gen_gbnf_ed(cmdType),
           grammar: File.read("lib/ed.gbnf"),
-          n_probs: 8,
+          n_probs: 3,
           stream: true
         })
 
-        r = llmq(http, request, false) do |r|
-          ret = r.end_with?("\n\*\n")
-          if ret
-            r = r.gsub(/\n\*\n$/, '')
+        response = ""
+        cancel = false
+        http.request(request) do |http_response|
+        http_response.read_body do |chunk|
+          begin
+            redo if chunk.empty?
+            redo unless chunk.start_with?('data: ')
+            data = chunk[6..-1]
+            json = JSON.parse(data)
+            text = json["choices"].first["text"]
+            if text
+              
+              response += text
+              $ui.infer_log text # stream to console
+              $ui.infer_log_logprobs \
+                json["choices"].
+                first["logprobs"]["content"].
+                first["top_logprobs"].
+                map { |v| "(%32s %.2f) " % [v["token"].
+                                                        gsub("\n","\\n").
+                                                        gsub("\t","\\t"), v["logprob"]] }.
+                    join(" ") + "\n"
+              end
+            end
+          rescue => e
+            $stderr.puts "Error: #{e.message}"
+            $stderr.puts e.backtrace
+            exit
+            cancel = true
+            break
           end
-          ret
         end
-
+        break if cancel
+        logme response
         logme
         logme "============================="
         logme
@@ -438,7 +464,7 @@ def merge_iteration(ui, llmc, temperature, repo, reset_target, dst_branch_name, 
       end
     end
     if commit_oid.nil?
-      puts "Failed to commit #{sha}"
+      $stderr.puts "Failed to commit #{sha}"
       exit
     end       
     merge_result[:llm_ported] = ported
@@ -448,8 +474,8 @@ def merge_iteration(ui, llmc, temperature, repo, reset_target, dst_branch_name, 
     merge_result[:reset_target] = reset_target
 
   rescue => e
-    puts "Error processing commit #{sha}: #{e.message}"
-    puts e.backtrace
+    $stderr.puts "Error processing commit #{sha}: #{e.message}"
+    $stderr.puts e.backtrace
     repo.reset(reset_target, :hard)
     exit #redo
   end

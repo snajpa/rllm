@@ -60,14 +60,19 @@ end.parse!
 
 class AppUi
   attr_accessor :top_panes
-  def initialize(init_tree, init_status)
-    @log = []
+  def initialize(startit, init_tree, init_status)
+    @started = false
+    return unless startit
+    @log = ""
+    @infer_log = ""
+    @infer_log_logprobs = ""
+    @infer_log_logprobs_tokens = ""
     @meta_tree_data = init_tree.dup
     
     @tty_tree_data = NcursesUI::meta_to_tty_tree(@meta_tree_data)
     @node_lookup = NcursesUI::build_node_lookup(@meta_tree_data)
 
-    @top_panes = Widgets::TopSubPanes.new(1)
+    @top_panes = Widgets::TopSubPanes.new(2)
     @tree_pane = Widgets::TreePane.new(@tty_tree_data)
     @content_pane = Widgets::ContentPane.new
     @status_bar = Widgets::StatusBar.new
@@ -82,25 +87,57 @@ class AppUi
 
     start
     update_status(init_status)
+    @ui.post_event(:disable_tail_mode_bottom)
+    @ui.post_event(cmd: :update_bottom_content, lines: (1..90).map{|i| "Line #{i}"})
   end
 
   def update_tree(&block)
     new_meta_tree_data = block_given? ? block.call(@meta_tree_data) : @meta_tree_data
     @meta_tree_data = new_meta_tree_data
     if @meta_tree_data.nil?
-      puts "Meta tree data is nil"
+      $stderr.puts "Meta tree data is nil"
       exit
     end
     @ui.post_event(cmd: :update_tree, meta_tree_data: @meta_tree_data)
   end
 
-  def log(msg)
-    msg.split("\n").each do |line|
-      @meta_tree_data["Root"][:ui_content] << line
-      @log << line
+  def infer_log(msg)
+    unless @started
+      print msg
+      return
     end
+    @infer_log += msg
+    #@infer_log += "\n" unless @infer_log.end_with?("\n")
+    @ui.post_event(cmd: :update_top_pane, index: 0, :ui_content => @infer_log.split("\n"))
+  end
+
+  def infer_log_logprobs(msg)
+    unless @started
+      #puts msg
+      return
+    end
+    @infer_log_logprobs += msg
+    @infer_log_logprobs += "\n" unless @infer_log_logprobs.end_with?("\n")
+    @ui.post_event(cmd: :update_top_pane, index: 1, :ui_content => @infer_log_logprobs.split("\n"))
+  end
+  def infer_log_logprobs_tokens(msg)
+    unless @started
+      #puts msg
+      return
+    end
+    @infer_log_logprobs_tokens += msg
+    @infer_log_logprobs_tokens += "\n" unless @infer_log_logprobs_tokens.end_with?("\n")
+    @ui.post_event(cmd: :update_top_pane, index: 1, :ui_content => @infer_log_logprobs.split("\n"))
+  end
+  def log(msg)
+    unless @started
+      puts msg
+      return
+    end
+    @log += msg
+    @log += "\n" unless @log.end_with?("\n")
+    @meta_tree_data["Root"][:ui_content] = @log.split("\n")
     update_tree
-    @ui.post_event(cmd: :update_top_pane, index: 0, :ui_content => @log)
   end
 
   def update_status(message)
@@ -108,8 +145,10 @@ class AppUi
   end
   def start
     @ui.start
+    @started = true
   end
   def stop
+    @started = false
     @ui.post_event(:stop)
   end
   def join
@@ -117,7 +156,7 @@ class AppUi
   end
 end
 
-$ui = AppUi.new(
+$ui = AppUi.new(false,
   { "Root" => { :ui_content => ["Initializing..."], :children => {} } },
   "Initializing..."
 )
@@ -142,7 +181,7 @@ def force_push(repo_dir, dst_remote_name, dst_branch_name)
   $?
 end
 
-def ssh_build_iteration(ui, tree, ssh_host, ssh_user, ssh_options, quiet, dst_remote_name, dst_branch_name, dir, cores, &block)
+def ssh_build_iteration(tree, ssh_host, ssh_user, ssh_options, quiet, dst_remote_name, dst_branch_name, dir, cores, &block)
   commands = [
     { cmd: "cd #{dir}; git fetch #{dst_remote_name}", can_fail: false },
     { cmd: "cd #{dir}; git checkout -f master", can_fail: false },
@@ -152,7 +191,7 @@ def ssh_build_iteration(ui, tree, ssh_host, ssh_user, ssh_options, quiet, dst_re
     { cmd: "cd #{dir}; cp ~/okconfig ~/linux-rllm/.config", can_fail: false },
     { cmd: "cd #{dir}; make -j #{cores}", can_fail: true }
   ]
-  run_ssh_commands(ui, "172.16.106.12", "root", ssh_options, quiet, commands, &block)
+  run_ssh_commands("172.16.106.12", "root", ssh_options, quiet, commands, &block)
 end
 
 logme "Starting merge process"
@@ -199,7 +238,7 @@ ssh_options = {
   verify_host_key: :never
 }
 
-def process_commit_list(ui, quiet, llmc, llmc_fast, ssh_options, dst_remote_name, repo, src_sha, commit_list, dst_branch_name)
+def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, repo, src_sha, commit_list, dst_branch_name)
   results = {}
   src_commit = repo.lookup(src_sha)
   
@@ -232,7 +271,7 @@ def process_commit_list(ui, quiet, llmc, llmc_fast, ssh_options, dst_remote_name
       repo.checkout("refs/heads/#{dst_branch_name}")
 
       # Try merge iteration
-      result = merge_iteration(ui, llmc, 0.4, repo, reset_target, dst_branch_name, src_sha, sha, llmc_fast,
+      result = merge_iteration(llmc, 0.4, repo, reset_target, dst_branch_name, src_sha, sha, llmc_fast,
                                8192, 8192, 1*iter, results[sha], error_context)
       results[sha] = result if result[:resolved]
       #next unless result[:resolved]
@@ -307,9 +346,9 @@ end
 
 # Main execution
 begin
-  results = process_commit_list($ui, quiet, llmc, llmc_fast, ssh_options, dst_remote_name, repo, src_sha, commit_list, dst_branch_name)
+  results = process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, repo, src_sha, commit_list, dst_branch_name)
 rescue Interrupt => e
-  puts "Process interrupted: #{e.message}"
+  $stderr.puts "Process interrupted: #{e.message}"
 end
 
 $ui.stop

@@ -1,4 +1,4 @@
-def run_ssh_commands(ui, ssh_host, ssh_user, ssh_options, quiet, commands, &block)
+def run_ssh_commands(ssh_host, ssh_user, ssh_options, quiet, commands, &block)
   begin
     logme "Connecting to #{ssh_host} as #{ssh_user}" unless quiet
     Net::SSH.start(ssh_host, ssh_user, ssh_options) do |ssh|

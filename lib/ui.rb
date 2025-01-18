@@ -5,6 +5,9 @@ require 'curses'
 require 'tty-tree'
 require 'thread'
 
+###############################################################################
+# Widgets::Base
+###############################################################################
 module Widgets
   class Base
     attr_accessor :win, :top, :left, :height, :width
@@ -75,18 +78,20 @@ module Widgets
 end
 
 ###############################################################################
-# Top SubPanes (supports dynamic add/remove)
+# Top SubPanes
 ###############################################################################
 module Widgets
   class TopSubPanes < Base
     attr_accessor :focus_index, :headers, :contents,
-                  :scroll_offsets, :active
+                  :scroll_offsets, :active,
+                  :tail_modes # parallel array for each subpane
 
     def initialize(num_panes = 3)
       super()
       @headers        = Array.new(num_panes) { |i| "Pane #{i+1}" }
       @contents       = Array.new(num_panes) { ["Default Content"] }
       @scroll_offsets = Array.new(num_panes, 0)
+      @tail_modes     = Array.new(num_panes, true) # tail mode default ON
       @focus_index    = 0
       @active         = false
     end
@@ -99,6 +104,8 @@ module Widgets
       @headers << header_text
       @contents << content_lines
       @scroll_offsets << 0
+      @tail_modes << true
+      auto_scroll_to_bottom(num_panes - 1)  # if tail mode is on by default
     end
 
     def remove_pane(index)
@@ -106,9 +113,31 @@ module Widgets
       @headers.delete_at(index)
       @contents.delete_at(index)
       @scroll_offsets.delete_at(index)
+      @tail_modes.delete_at(index)
       # Adjust focus_index
       @focus_index = [@focus_index, num_panes - 1].min
       @focus_index = 0 if num_panes <= 0
+    end
+
+    #
+    # Called when we do :update_top_pane => we replace content and possibly scroll
+    #
+    def update_pane(index, header: nil, lines: nil)
+      return if index < 0 || index >= num_panes
+      @headers[index] = header if header
+      if lines
+        @contents[index] = Array(lines)
+        # If tail mode is enabled, auto-scroll to last lines
+        auto_scroll_to_bottom(index) if @tail_modes[index]
+      end
+    end
+
+    #
+    # Enable or disable tail mode for a single subpane
+    #
+    def set_tail_mode(index, enabled)
+      return if index < 0 || index >= num_panes
+      @tail_modes[index] = !!enabled
     end
 
     def resize(total_rows, total_cols)
@@ -131,7 +160,7 @@ module Widgets
 
       num_panes.times do |i|
         sub_left  = i * pane_width
-        # Last pane might get leftover columns if it doesn't divide evenly
+        # Last pane might get leftover columns
         sub_width = (i == num_panes - 1) ? (@width - (pane_width * (num_panes - 1))) : pane_width
 
         # If this subpane is the actively focused one, highlight border
@@ -160,15 +189,30 @@ module Widgets
     def handle_input(ch)
       return unless @active
 
+      idx = @focus_index
       case ch
       when Curses::KEY_PPAGE
-        page_up
+        page_up(idx)
       when Curses::KEY_NPAGE
-        page_down
+        page_down(idx)
+      when Curses::KEY_UP
+        single_line_up(idx)
+      when Curses::KEY_DOWN
+        single_line_down(idx)
       end
     end
 
     private
+
+    #
+    # Auto-scroll subpane i so the "latest lines" are visible
+    # (like a "tail" of a log).
+    #
+    def auto_scroll_to_bottom(i)
+      displayable = [@height - 3, 1].max
+      needed_offset = @contents[i].size - displayable
+      @scroll_offsets[i] = needed_offset < 0 ? 0 : needed_offset
+    end
 
     def draw_subpane_text(idx, sub_left, text_start_y, sub_width, text_area_height)
       lines       = @contents[idx]
@@ -195,18 +239,27 @@ module Widgets
       end
     end
 
-    def page_up
-      idx = @focus_index
+    def page_up(i)
       page_size = @height - 3
-      @scroll_offsets[idx] = [@scroll_offsets[idx] - page_size, 0].max
+      @scroll_offsets[i] = [@scroll_offsets[i] - page_size, 0].max
     end
 
-    def page_down
-      idx         = @focus_index
+    def page_down(i)
       page_size   = @height - 3
-      lines_count = @contents[idx].size
+      lines_count = @contents[i].size
       max_offset  = [lines_count - page_size, 0].max
-      @scroll_offsets[idx] = [@scroll_offsets[idx] + page_size, max_offset].min
+      @scroll_offsets[i] = [@scroll_offsets[i] + page_size, max_offset].min
+    end
+
+    def single_line_up(i)
+      @scroll_offsets[i] = [@scroll_offsets[i] - 1, 0].max
+    end
+
+    def single_line_down(i)
+      page_size   = @height - 3
+      lines_count = @contents[i].size
+      max_offset  = [lines_count - page_size, 0].max
+      @scroll_offsets[i] = [@scroll_offsets[i] + 1, max_offset].min
     end
   end
 end
@@ -236,19 +289,14 @@ module Widgets
     def render
       @win.clear
 
-      # If active, highlight border, else default
       border_color = @active ? 6 : 3
       draw_box(0, 0, @width, @height, border_color)
 
       lines = @tree.render.lines
 
       lines.each_with_index do |line, idx|
-        # Non-selected lines get color pair(4) (tree node color)
-        line_color = 4
-        # If active & selected, highlight with pair(2)
-        line_color = 2 if (@active && idx == @selected_index)
-
-        # Write the line
+        line_color = 4 # default tree node color
+        line_color = 2 if (@active && idx == @selected_index) # highlight selected
         draw_text(idx + 1, 2, line.chomp, line_color)
       end
 
@@ -277,7 +325,8 @@ end
 ###############################################################################
 module Widgets
   class ContentPane < Base
-    attr_accessor :lines, :scroll_offset, :active, :auto_update_enabled
+    attr_accessor :lines, :scroll_offset, :active,
+                  :auto_update_enabled, :tail_mode
 
     def initialize
       super()
@@ -285,6 +334,7 @@ module Widgets
       @scroll_offset        = 0
       @active               = false
       @auto_update_enabled  = true  # If false, we won't overwrite from tree
+      @tail_mode            = true  # Tail mode on by default
     end
 
     def resize(total_rows, total_cols)
@@ -300,7 +350,6 @@ module Widgets
     def render
       @win.clear
 
-      # Active border or default
       border_color = @active ? 6 : 3
       draw_box(0, 0, @width, @height, border_color)
 
@@ -326,12 +375,25 @@ module Widgets
         page_up
       when Curses::KEY_NPAGE
         page_down
+      when Curses::KEY_UP
+        single_line_up
+      when Curses::KEY_DOWN
+        single_line_down
       end
+      $stderr.puts "DEBUG BOTTOM KEY => #{ch.inspect}"
     end
 
+    #
+    # Replaces lines. If @tail_mode is true, auto-scroll to bottom.
+    #
     def set_lines(new_lines)
       @lines = new_lines
-      @scroll_offset = new_lines.size
+      # If tail_mode is enabled, jump to last page
+      if @tail_mode
+        displayable = [@height - 2, 1].max
+        needed_offset = @lines.size - displayable
+        @scroll_offset = (needed_offset < 0) ? 0 : needed_offset
+      end
     end
 
     private
@@ -345,6 +407,16 @@ module Widgets
       page_size   = @height - 2
       max_offset  = [@lines.size - page_size, 0].max
       @scroll_offset = [@scroll_offset + page_size, max_offset].min
+    end
+
+    def single_line_up
+      @scroll_offset = [@scroll_offset - 1, 0].max
+    end
+
+    def single_line_down
+      page_size  = @height - 2
+      max_offset = [@lines.size - page_size, 0].max
+      @scroll_offset = [@scroll_offset + 1, max_offset].min
     end
   end
 end
@@ -371,7 +443,6 @@ module Widgets
 
     def render
       @win.clear
-      # Always use color_pair(1) for status bar
       draw_text(0, 0, @message, 1)
       @win.refresh
     end
@@ -379,16 +450,17 @@ module Widgets
 end
 
 ###############################################################################
-# NcursesUI: Manages the loop & handle_hash_events
+# NcursesUI: Manages the loop, focusing, event queue, etc.
 ###############################################################################
 class NcursesUI
   attr_reader :event_queue
 
-  # We'll define the focus states as:
-  #   0..(num_subpanes-1) => top subpanes
-  #   num_subpanes => tree
-  #   num_subpanes+1 => bottom
-  #
+  # With 3 subpanes, we have focus states:
+  #   0 -> subpane0
+  #   1 -> subpane1
+  #   2 -> subpane2
+  #   3 -> tree
+  #   4 -> bottom
   def initialize(top_panes:, tree_pane:, content_pane:, status_bar:, node_lookup:)
     @top_panes    = top_panes
     @tree_pane    = tree_pane
@@ -396,11 +468,11 @@ class NcursesUI
     @status_bar   = status_bar
 
     # node_lookup => node_name => { :ui_content => [...], :children => {}, :other_keys => ... }
-    @node_lookup = node_lookup
+    @node_lookup  = node_lookup
 
-    @focus_state = 0
-    @running     = false
-    @event_queue = Queue.new
+    @focus_state  = 0  # start focusing subpane #0
+    @running      = false
+    @event_queue  = Queue.new
   end
 
   def start
@@ -420,8 +492,10 @@ class NcursesUI
     @running = false
   end
 
+  #
+  # Helpers for building TTY::Tree, node lookup
+  #
   def self.meta_to_tty_tree(meta_tree)
-    # Recursively strip out :ui_content, :other_keys, leaving only the structure
     result = {}
     meta_tree.each do |node_name, node_val|
       child_hash = node_val[:children] || {}
@@ -429,7 +503,7 @@ class NcursesUI
     end
     result
   end
-  
+
   def self.build_node_lookup(meta_tree, lookup = {})
     meta_tree.each do |node_name, node_val|
       lookup[node_name] = node_val
@@ -438,7 +512,7 @@ class NcursesUI
     end
     lookup
   end
-  
+
   private
 
   def run_curses_loop
@@ -469,18 +543,18 @@ class NcursesUI
     Curses.stdscr.keypad(true)
 
     # We define 6 color pairs:
-    # 1) Status bar  (white on blue)
-    # 2) Highlight   (black on white) for selected line or active subpane header
-    # 3) Default     (white on black)
-    # 4) Tree nodes  (yellow on black for example)
-    # 5) Subpane header (cyan on black)
+    # 1) Status bar (white on blue)
+    # 2) Highlight text (black on white)
+    # 3) Default (white on black)
+    # 4) Tree node lines (yellow on black)
+    # 5) Subpane header normal (cyan on black)
     # 6) Active border (red on black)
-    Curses.init_pair(1, Curses::COLOR_WHITE, Curses::COLOR_BLUE)   # Status bar
-    Curses.init_pair(2, Curses::COLOR_BLACK, Curses::COLOR_WHITE)  # Highlight text
-    Curses.init_pair(3, Curses::COLOR_WHITE, Curses::COLOR_BLACK)  # Default
-    Curses.init_pair(4, Curses::COLOR_YELLOW, Curses::COLOR_BLACK) # Tree node lines
-    Curses.init_pair(5, Curses::COLOR_CYAN, Curses::COLOR_BLACK)   # Subpane header normal
-    Curses.init_pair(6, Curses::COLOR_RED, Curses::COLOR_BLACK)    # Active border
+    Curses.init_pair(1, Curses::COLOR_WHITE, Curses::COLOR_BLUE)
+    Curses.init_pair(2, Curses::COLOR_BLACK, Curses::COLOR_WHITE)
+    Curses.init_pair(3, Curses::COLOR_WHITE, Curses::COLOR_BLACK)
+    Curses.init_pair(4, Curses::COLOR_YELLOW, Curses::COLOR_BLACK)
+    Curses.init_pair(5, Curses::COLOR_CYAN, Curses::COLOR_BLACK)
+    Curses.init_pair(6, Curses::COLOR_RED, Curses::COLOR_BLACK)
   end
 
   def resize_widgets
@@ -492,6 +566,7 @@ class NcursesUI
     @content_pane.resize(rows, cols)
     @status_bar.resize(rows, cols)
 
+    # If focus_state < number_of_subpanes, top is active
     if @focus_state < @top_panes.num_panes
       @top_panes.active      = true
       @top_panes.focus_index = @focus_state
@@ -499,9 +574,8 @@ class NcursesUI
       @top_panes.active      = false
     end
 
-    # If top has e.g. 3 subpanes => states 0..2 => tree=3 => bottom=4
-    tree_state   = @top_panes.num_panes
-    bottom_state = tree_state + 1
+    tree_state   = @top_panes.num_panes  # => 3
+    bottom_state = tree_state + 1        # => 4
 
     @tree_pane.active        = (@focus_state == tree_state)
     @content_pane.active     = (@focus_state == bottom_state)
@@ -549,10 +623,9 @@ class NcursesUI
   end
 
   def reload_tree(new_meta_tree_data)
-    @tty_tree_data = NcursesUI::meta_to_tty_tree(new_meta_tree_data)
-    @node_lookup  = NcursesUI::build_node_lookup(new_meta_tree_data)
+    @tty_tree_data = self.class.meta_to_tty_tree(new_meta_tree_data)
+    @node_lookup   = self.class.build_node_lookup(new_meta_tree_data)
     @tree_pane.tree = TTY::Tree.new(@tty_tree_data)
-    #@tree_pane.reset_selection
   end
 
   #
@@ -571,7 +644,7 @@ class NcursesUI
 
     when :update_bottom_content
       # { cmd: :update_bottom_content, lines: [...], override_auto: bool }
-      lines  = event[:lines]  || []
+      lines = event[:lines] || []
       @content_pane.set_lines(lines)
       if event.key?(:override_auto)
         @content_pane.auto_update_enabled = !event[:override_auto] ? true : false
@@ -580,20 +653,16 @@ class NcursesUI
     when :update_top_pane
       # { cmd: :update_top_pane, index: 1, header: "New Header", ui_content: [...] }
       i = event[:index].to_i
+      hdr = event[:header]
       if i < @top_panes.num_panes
-        if event[:header]
-          @top_panes.headers[i] = event[:header].to_s
-        end
-        if event[:ui_content]
-          @top_panes.contents[i] = Array(event[:ui_content])
-        end
+        @top_panes.update_pane(i, header: hdr, lines: event[:ui_content])
       end
 
     when :add_top_pane
       # { cmd: :add_top_pane, header: "XYZ", ui_content: [...] }
-      hdr  = event[:header]  || "Pane #{@top_panes.num_panes+1}"
-      cnt  = event[:ui_content] || ["(empty)"]
-      @top_panes.add_pane(hdr, Array(cnt))
+      hdr  = event[:header]    || "Pane #{@top_panes.num_panes+1}"
+      cnt  = event[:ui_content]|| ["(empty)"]
+      @top_panes.add_pane(hdr, cnt)
 
     when :remove_top_pane
       # { cmd: :remove_top_pane, index: 1 }
@@ -605,20 +674,40 @@ class NcursesUI
 
     when :enable_bottom_auto_update
       @content_pane.auto_update_enabled = true
+
+    when :enable_tail_mode_top
+      i = event[:index].to_i
+      @top_panes.set_tail_mode(i, true)
+
+    when :disable_tail_mode_top
+      i = event[:index].to_i
+      @top_panes.set_tail_mode(i, false)
+
+    when :enable_tail_mode_bottom
+      @content_pane.tail_mode = true
+
+    when :disable_tail_mode_bottom
+      @content_pane.tail_mode = false
     end
   end
 
+  #
+  # Focus switching logic
+  #
   def handle_user_input(ch)
     case ch
     when 'q'
       stop
-      exit
+      #exit
     # Tab can be ASCII 9, "\t" or KEY_BTAB
     when 9, "\t", Curses::KEY_BTAB
       # We have top_panes.num_panes subpane states, then tree, then bottom
       max_focus = @top_panes.num_panes + 1
+      # e.g. 3 subpanes => states 0..2 => tree=3 => bottom=4
       @focus_state = (@focus_state + 1) % (max_focus + 1)
+
     else
+      # Let the active widget handle input
       @top_panes.handle_input(ch)
       @tree_pane.handle_input(ch)
       @content_pane.handle_input(ch)
@@ -627,13 +716,13 @@ class NcursesUI
 end
 
 ###############################################################################
-# 3. Demonstration
+# Demo Usage
 ###############################################################################
 if __FILE__ == $PROGRAM_NAME
   # A sample meta-tree
   meta_tree_data = {
     "Root" => {
-      :ui_content => ["Root line1", "Root line2"],
+      :ui_content => [""],
       :children => {
         "Child A" => {
           :ui_content => ["Child A - line1"],
@@ -647,9 +736,14 @@ if __FILE__ == $PROGRAM_NAME
     }
   }
 
+  # For demonstration, add lines to the Root
+  60.times do |i|
+    meta_tree_data["Root"][:ui_content] << "Root line #{i}"
+  end
+
   # Build TTY::Tree data & node lookup
-  tty_tree_data = NcursesUI::meta_to_tty_tree(meta_tree_data)
-  node_lookup   = NcursesUI::build_node_lookup(meta_tree_data)
+  tty_tree_data = NcursesUI.meta_to_tty_tree(meta_tree_data)
+  node_lookup   = NcursesUI.build_node_lookup(meta_tree_data)
 
   # Create widgets
   top_panes    = Widgets::TopSubPanes.new(3)
@@ -668,38 +762,36 @@ if __FILE__ == $PROGRAM_NAME
 
   ui.start
 
-  # Main thread can do asynchronous work
-  # 1) Wait a bit, then update the status
+  # Some demonstration updates
   sleep(3)
-  ui.post_event(cmd: :update_status, message: "Status changed from main thread...")
+  ui.post_event(cmd: :update_status, message: "Status changed from main...")
 
-  # 2) Wait, then disable bottom auto-update
+  # 1) Update top pane #0 with lines => auto-scroll (tail mode default on)
   sleep(3)
-  ui.post_event(cmd: :disable_bottom_auto_update)
-  ui.post_event(cmd: :update_bottom_content, lines: ["Hello from main override!", "2nd line override"], override_auto: true)
+  lines_for_pane0 = (1..20).map { |n| "Top Pane #0 line #{n}" }
+  ui.post_event(cmd: :update_top_pane, index: 0, header: "Pane #1 updated", ui_content: lines_for_pane0)
 
-  # 3) Add a top pane
+  # 2) We'll disable tail mode for that top pane #0
   sleep(3)
-  ui.post_event(cmd: :add_top_pane, header: "Extra Pane", ui_content: ["Dynamically added top pane"])
+  ui.post_event(cmd: :disable_tail_mode_top, index: 0)
 
-  # 4) Remove an existing top pane, e.g. index 1
+  # 3) Another update => see it no longer jumps to bottom
   sleep(3)
-  ui.post_event(cmd: :remove_top_pane, index: 1)
+  more_lines_for_pane0 = lines_for_pane0 + ["New line A", "New line B"]
+  ui.post_event(cmd: :update_top_pane, index: 0, header: "Still Pane #1", ui_content: more_lines_for_pane0)
+  ui.post_event(cmd: :update_top_pane, index: 1, header: "Still Pane #2", ui_content: more_lines_for_pane0)
 
-  # 5) Wait, then re-enable auto-update for bottom
+  # 4) Toggle bottom pane's tail mode off
   sleep(3)
-  ui.post_event(cmd: :enable_bottom_auto_update)
+  ui.post_event(cmd: :disable_tail_mode_bottom)
+  ui.post_event(cmd: :update_bottom_content, lines: (1..15).map { |i| "Bottom line => #{i}" })
 
-  # 6) Wait, then update the tree by adding "Child C" under "Root"
+  # 5) Re-enable tail mode bottom
   sleep(3)
-  meta_tree_data["Root"][:children]["Child C"] = {
-    :ui_content => ["Child C line1", "Child C line2", "Child C line3"],
-    :children=> {}
-  }
-  ui.post_event(cmd: :update_tree, meta_tree_data: meta_tree_data)
+  ui.post_event(cmd: :enable_tail_mode_bottom)
 
   # Wait a bit, then stop
-  sleep(15)
+  sleep(5)
   ui.post_event(:stop)
   ui.join
   puts "Main thread: UI has shut down."
