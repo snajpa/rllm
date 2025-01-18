@@ -470,9 +470,16 @@ class NcursesUI
     # node_lookup => node_name => { :ui_content => [...], :children => {}, :other_keys => ... }
     @node_lookup  = node_lookup
 
-    @focus_state  = 0  # start focusing subpane #0
+    # -- Modified: focus on the tree pane at start
+    @focus_state  = @top_panes.num_panes # This is 3 if num_panes = 3
+    @prev_focus_state = nil
     @running      = false
     @event_queue  = Queue.new
+
+    # We'll store the original tail-mode states so we can restore them
+    # whenever a pane loses focus after we've forced tail-mode off.
+    @top_panes_original_tail = Array.new(@top_panes.num_panes, false)
+    @bottom_original_tail    = false
   end
 
   def start
@@ -566,6 +573,15 @@ class NcursesUI
     @content_pane.resize(rows, cols)
     @status_bar.resize(rows, cols)
 
+    # Detect if focus changed from the previously-focused pane
+    if @focus_state != @prev_focus_state
+      # First, restore tail mode for whichever pane was losing focus
+      restore_tail_mode(@prev_focus_state)
+      # Then, disable tail mode if needed for the newly focused pane
+      disable_tail_mode_if_needed(@focus_state)
+      @prev_focus_state = @focus_state
+    end
+
     # If focus_state < number_of_subpanes, top is active
     if @focus_state < @top_panes.num_panes
       @top_panes.active      = true
@@ -592,6 +608,51 @@ class NcursesUI
 
     @content_pane.render
     @status_bar.render
+  end
+
+  #
+  # Temporarily disable tail mode if it's enabled on the new focus
+  #
+  def disable_tail_mode_if_needed(state)
+    return if state.nil?
+    if state < @top_panes.num_panes
+      # It's one of the top subpanes
+      i = state
+      @top_panes_original_tail[i] = @top_panes.tail_modes[i]
+      if @top_panes.tail_modes[i]
+        @top_panes.set_tail_mode(i, false)
+      end
+    elsif state == @top_panes.num_panes
+      # This is the tree pane => do nothing
+      return
+    else
+      # This must be the bottom pane
+      @bottom_original_tail = @content_pane.tail_mode
+      if @content_pane.tail_mode
+        @content_pane.tail_mode = false
+      end
+    end
+  end
+
+  #
+  # Restore the original tail mode if the old focus had it turned on
+  #
+  def restore_tail_mode(state)
+    return if state.nil?
+    if state < @top_panes.num_panes
+      i = state
+      if @top_panes_original_tail[i]
+        @top_panes.set_tail_mode(i, true)
+      end
+    elsif state == @top_panes.num_panes
+      # Tree pane => do nothing
+      return
+    else
+      # Bottom pane
+      if @bottom_original_tail
+        @content_pane.tail_mode = true
+      end
+    end
   end
 
   def set_bottom_content_from_tree
@@ -784,7 +845,7 @@ if __FILE__ == $PROGRAM_NAME
   # 4) Toggle bottom pane's tail mode off
   sleep(3)
   ui.post_event(cmd: :disable_tail_mode_bottom)
-  ui.post_event(cmd: :update_bottom_content, lines: (1..15).map { |i| "Bottom line => #{i}" })
+  ui.post_event(cmd: :update_bottom_content, lines: (1..150).map { |i| "Bottom line => #{i}" })
 
   # 5) Re-enable tail mode bottom
   sleep(3)
