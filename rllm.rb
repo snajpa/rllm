@@ -18,6 +18,8 @@ require_relative './lib/fixup_iteration'
 require_relative './lib/ask_and_gather_context'
 require_relative './lib/run_ssh_commands'
 require_relative './lib/utils'
+require_relative './lib/ed'
+require_relative './lib/ui'
 
 # Configuration
 # cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_F16=true -DGGML_CUDA_PEER_MAX_BATCH_SIZE=64 -DGGML_CUDA_FA_ALL_QUANTS=true
@@ -32,15 +34,13 @@ LLAMA_API_ENDPOINT_GOOD_SLOW = 'http://localhost:8081'
 LLAMA_API_ENDPOINT_MEH_FAST = 'http://localhost:8080'
 LOG_FILE = 'rllm.log'
 
-options = {}
-
 repo_dir = '/home/snajpa/linux'
 
 src_sha = 'c45323b7560e' # random linux commit
 #cherrypick_commit_range = '319addc2ad90..cf9971c0322e' # upto: tmpfs: use 1/2 of memcg limit if present v3
-#cherrypick_commit_range = 'd3e69f8ab5df..c09b3eaeafd9' # syslog-ns
+cherrypick_commit_range = 'd3e69f8ab5df..c09b3eaeafd9' # syslog-ns
 #src_sha = '0bc21e701a6f' # 6.13-rc5+
-cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e' # full stack from 6.12.7
+#cherrypick_commit_range = '319addc2ad90..68eb45c3ef9e' # full stack from 6.12.7
 #src_sha = '8155b4ef3466' # next-20240104
 #cherrypick_commit_range = 'd3e69f8ab5df..c0dcbf44ec68'
 
@@ -58,6 +58,74 @@ OptionParser.new do |opts|
   opts.banner = "Usage: rllm.rb [options]"
 end.parse!
 
+class AppUi
+  attr_accessor :top_panes
+  def initialize(init_tree, init_status)
+    @log = []
+    @meta_tree_data = init_tree.dup
+    
+    @tty_tree_data = NcursesUI::meta_to_tty_tree(@meta_tree_data)
+    @node_lookup = NcursesUI::build_node_lookup(@meta_tree_data)
+
+    @top_panes = Widgets::TopSubPanes.new(1)
+    @tree_pane = Widgets::TreePane.new(@tty_tree_data)
+    @content_pane = Widgets::ContentPane.new
+    @status_bar = Widgets::StatusBar.new
+
+    @ui = NcursesUI.new(
+      top_panes:    @top_panes,
+      tree_pane:    @tree_pane,
+      content_pane: @content_pane,
+      status_bar:   @status_bar,
+      node_lookup:  @node_lookup
+    )
+
+    start
+    update_status(init_status)
+  end
+
+  def update_tree(&block)
+    new_meta_tree_data = block_given? ? block.call(@meta_tree_data) : @meta_tree_data
+    @meta_tree_data = new_meta_tree_data
+    if @meta_tree_data.nil?
+      puts "Meta tree data is nil"
+      exit
+    end
+    @ui.post_event(cmd: :update_tree, meta_tree_data: @meta_tree_data)
+  end
+
+  def log(msg)
+    msg.split("\n").each do |line|
+      @meta_tree_data["Root"][:ui_content] << line
+      @log << line
+    end
+    update_tree
+    @ui.post_event(cmd: :update_top_pane, index: 0, :ui_content => @log)
+  end
+
+  def update_status(message)
+    @ui.post_event(cmd: :update_status, message: message)
+  end
+  def start
+    @ui.start
+  end
+  def stop
+    @ui.post_event(:stop)
+  end
+  def join
+    @ui.join
+  end
+end
+
+$ui = AppUi.new(
+  { "Root" => { :ui_content => ["Initializing..."], :children => {} } },
+  "Initializing..."
+)
+
+def logme(*msga)
+  $ui.log(msga.join("\n"))
+end
+
 repo = Rugged::Repository.new(repo_dir)
 
 llmc = OpenAI::Client.new
@@ -74,7 +142,7 @@ def force_push(repo_dir, dst_remote_name, dst_branch_name)
   $?
 end
 
-def ssh_build_iteration(ssh_host, ssh_user, ssh_options, quiet, dst_remote_name, dst_branch_name, dir, cores, &block)
+def ssh_build_iteration(ui, tree, ssh_host, ssh_user, ssh_options, quiet, dst_remote_name, dst_branch_name, dir, cores, &block)
   commands = [
     { cmd: "cd #{dir}; git fetch #{dst_remote_name}", can_fail: false },
     { cmd: "cd #{dir}; git checkout -f master", can_fail: false },
@@ -84,15 +152,15 @@ def ssh_build_iteration(ssh_host, ssh_user, ssh_options, quiet, dst_remote_name,
     { cmd: "cd #{dir}; cp ~/okconfig ~/linux-rllm/.config", can_fail: false },
     { cmd: "cd #{dir}; make -j #{cores}", can_fail: true }
   ]
-  run_ssh_commands("172.16.106.12", "root", ssh_options, quiet, commands, &block)
+  run_ssh_commands(ui, "172.16.106.12", "root", ssh_options, quiet, commands, &block)
 end
 
-puts "Starting merge process"
-puts "Source commit: #{src_sha}"
-puts "Cherrypick commit range: #{cherrypick_commit_range}"
-puts "Destination branch: #{dst_branch_name}"
-puts "Destination remote: #{dst_remote_name}"
-puts "Repository: #{repo_dir}"
+logme "Starting merge process"
+logme "Source commit: #{src_sha}"
+logme "Cherrypick commit range: #{cherrypick_commit_range}"
+logme "Destination branch: #{dst_branch_name}"
+logme "Destination remote: #{dst_remote_name}"
+logme "Repository: #{repo_dir}"
 
 def extract_error_context(b)
   error_context_lines = {}
@@ -120,7 +188,7 @@ if File.exist?('merge_results.bin') && prev_results.empty?
   prev_results = Marshal.load(f.read)
   f.close
   #File.delete('merge_results.bin')
-  puts "Loaded previous merge results"
+  logme "Loaded previous merge results"
 end
 
 quiet = false
@@ -131,7 +199,7 @@ ssh_options = {
   verify_host_key: :never
 }
 
-def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, repo, src_sha, commit_list, dst_branch_name)
+def process_commit_list(ui, quiet, llmc, llmc_fast, ssh_options, dst_remote_name, repo, src_sha, commit_list, dst_branch_name)
   results = {}
   src_commit = repo.lookup(src_sha)
   
@@ -151,7 +219,7 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
       iter += 1
       commit_str = "#{sha[0..7]} - #{commit.message.split("\n").first}"
       iters_str = "\n#{iter}/#{max_iterations} iters, commit: #{n_commit}/#{n_commits} #{commit_str}: "
-      puts "#{iters_str}merging commit"
+      logme "#{iters_str}merging commit"
 
       # Setup initial branch state
       repo.reset(reset_target, :hard)
@@ -164,8 +232,8 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
       repo.checkout("refs/heads/#{dst_branch_name}")
 
       # Try merge iteration
-      result = merge_iteration(llmc, 0.4, repo, reset_target, dst_branch_name, src_sha, sha, llmc_fast,
-                               8192, 8192, 25*iter, results[sha], error_context)
+      result = merge_iteration(ui, llmc, 0.4, repo, reset_target, dst_branch_name, src_sha, sha, llmc_fast,
+                               8192, 8192, 1*iter, results[sha], error_context)
       results[sha] = result if result[:resolved]
       #next unless result[:resolved]
 
@@ -173,14 +241,14 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
 
       # Only do this if we're doing the last commit
       if $compile_last && (n_commit != n_commits)
-        puts "Skipping build for non-last commit"
+        logme "Skipping build for non-last commit"
         reset_target = result[:commited_as]
         build_ok = true
         next
       else
         if !result[:llm_ported] && (!$compile_last || n_commit != n_commits)
           # Validation not needed when LLM didn't touch the code
-          puts "Skipping build for non-ported commit"
+          logme "Skipping build for non-ported commit"
           build_ok = true
           reset_target = result[:commited_as]
           next
@@ -197,14 +265,14 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
       #next unless pushed
       
       15.times do |fixup_iter|
-        puts "#{iters_str}Build and fixup iteration #{fixup_iter}\n\n"
+        logme "#{iters_str}Build and fixup iteration #{fixup_iter}\n\n"
         # Try build
         b = ssh_build_iteration("172.16.106.12", "root", ssh_options, quiet,
                               dst_remote_name, dst_branch_name, "~/linux-rllm", 64)
         build_ok = b[:results].last[:exit_status] == 0
         
         if !build_ok
-          puts "#{iters_str}Build failed, trying to fixup the error, iteration #{fixup_iter}"
+          logme "#{iters_str}Build failed, trying to fixup the error, iteration #{fixup_iter}"
           error_context = extract_error_context(b)
           fixup_result = fixup_iteration(llmc, 0.3, repo, sha, error_context, "", 
                                          llmc_fast, 768, 2048, 25*iter)             
@@ -220,14 +288,14 @@ def process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, re
               update_ref: "HEAD"
             })
             repo.reset(commit_oid, :hard)
-            puts "#{iters_str}Fixup commit #{commit_oid} created\n\n"
+            logme "#{iters_str}Fixup commit #{commit_oid} created\n\n"
             #reset_target = commit_oid
           else
-            puts fixup_result[:message]
+            logme fixup_result[:message]
           end
         else
           reset_target = result[:commited_as]
-          puts "#{iters_str}Build successful!"
+          logme "#{iters_str}Build successful!"
           break
         end
       end
@@ -239,7 +307,11 @@ end
 
 # Main execution
 begin
-  results = process_commit_list(quiet, llmc, llmc_fast, ssh_options, dst_remote_name, repo, src_sha, commit_list, dst_branch_name)
+  results = process_commit_list($ui, quiet, llmc, llmc_fast, ssh_options, dst_remote_name, repo, src_sha, commit_list, dst_branch_name)
 rescue Interrupt => e
   puts "Process interrupted: #{e.message}"
 end
+
+$ui.stop
+$ui.join
+puts "Main thread: UI has shut down. Exiting."

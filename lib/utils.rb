@@ -15,7 +15,8 @@ def get_file_context(repo, path, linenumbers, context_lines = 8)
     end
   end
   max_digits = context.keys.max.to_s.length
-  context.sort.map { |k, v| "%#{max_digits}d %s" % [k+1, v] }.join("\n")
+  #context.sort.map { |k, v| "%#{max_digits}d %s" % [k+1, v] }.join("\n")
+  context.sort.map { |k, v| "%s" % [v] }.join("\n")
 end
 
 def save_slot(client, save_name)
@@ -34,15 +35,15 @@ def save_slot(client, save_name)
     response = http.request(request)
     
     if response.is_a?(Net::HTTPSuccess)
-      #puts "Slot saved successfully with name: #{save_name}"
+      #logme "Slot saved successfully with name: #{save_name}"
       response.code.to_i
     else
-      #puts "Failed to save slot: #{response.code} - #{response.body}"
+      #logme "Failed to save slot: #{response.code} - #{response.body}"
       response.code.to_i
     end
   rescue => e
-    #puts "Failed to save slot: #{e.message}"
-    #puts e.backtrace
+    #logme "Failed to save slot: #{e.message}"
+    #logme e.backtrace
     500
   end
 end
@@ -63,15 +64,15 @@ def restore_slot(client, save_name)
     response = http.request(request)
     
     if response.is_a?(Net::HTTPSuccess)
-      #puts "Slot restored successfully with name: #{save_name}"
+      #logme "Slot restored successfully with name: #{save_name}"
       response.code.to_i
     else
-      #puts "Failed to restore slot: #{response.code} - #{response.body}"
+      #logme "Failed to restore slot: #{response.code} - #{response.body}"
       response.code.to_i
     end
   rescue => e
-    #puts "Failed to restore slot: #{e.message}"
-    #puts e.backtrace
+    #logme "Failed to restore slot: #{e.message}"
+    #logme e.backtrace
     500
   end
 end
@@ -81,13 +82,13 @@ def warmup_kv_cache_common_prompt(client, common_prompt)
 
   save_name = Digest::SHA256.hexdigest(common_prompt)
 
-  #puts "Warming up KV cache by loading cache save..."
+  #logme "Warming up KV cache by loading cache save..."
   ret = restore_slot(client, save_name)
   if ret == 501
-    #puts "KV cache unsupported. Skipping..."
+    #logme "KV cache unsupported. Skipping..."
     return
   elsif ret == 400
-    print "(KV #{ret}..."
+    logme "(KV #{ret}..."
     client.completions(
       parameters: {
         temperature: 0.0,
@@ -97,11 +98,77 @@ def warmup_kv_cache_common_prompt(client, common_prompt)
     )
     ret = save_slot(client, save_name)
     if ret == 200
-      print " saved) "
+      logme " saved) "
     else
-      print " failed) "
+      logme " failed) "
     end
   else
-    #puts "KV cache restored. Ret code: #{ret}"
+    #logme "KV cache restored. Ret code: #{ret}"
   end
+end
+
+def gen_gbnf_ed(cmdType)
+  <<~GBNF
+  root ::= #{cmdType}
+
+  linespec ::= address | address "," address | "," address{0,1} | address ","
+  address ::= lineno | "." | "$" | "/" pattern "/" | ("+" | "-") lineno{0,1}
+
+  delCmd ::= (linespec wsl)? "d" newline
+  insCmd ::= (linespec wsl)? "i" newline textblock
+  wrCmd  ::= (linespec wsl)? "w" (ws filename)? newline
+  qtCmd  ::= (linespec wsl)? "q" newline
+
+  textblock ::= (textline newline)* "."
+  textline ::= [^.\n]+
+
+  pattern ::= [^/]+
+  replacement ::= [^/]+
+
+  newline ::= "\n"
+  filename ::= [^ \t\n]+
+  lineno ::= [0-9]+
+
+  ws ::= [ \t\n]*
+  wsl ::= [ \t]+
+  GBNF
+end
+
+def llmq(http, request, cancel, &block)
+  response = ""
+  cancel = false
+    http.request(request) do |http_response|
+    http_response.read_body do |chunk|
+      begin
+        redo if chunk.empty?
+        redo unless chunk.start_with?('data: ')
+        data = chunk[6..-1]
+        json = JSON.parse(data)
+        text = json["choices"].first["text"]
+        if text
+          
+          response += text
+          #logme text # stream to console
+          logme json["choices"].
+               first["logprobs"]["content"].
+               first["top_logprobs"].
+               map { |v| "(%32s %.2f) " % [v["token"].
+                                                      gsub("\n","\\n").
+                                                      gsub("\t","\\t"), v["logprob"]] }.
+               join(" ")
+          if block_given?
+            break if block.call(response)
+          end
+        end
+      rescue => e
+        logme "Error: #{e.message}"
+        logme e.backtrace
+        exit
+        cancel = true
+        break
+      end
+    end
+    break if cancel
+  end
+  response
 end

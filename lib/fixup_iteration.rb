@@ -67,7 +67,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
   
   PROMPT
 
-  puts "Gathering additional context for #{error_files.uniq.size} files with #{parsed_error_lines.size} errors"
+  logme "Gathering additional context for #{error_files.uniq.size} files with #{parsed_error_lines.size} errors"
   # Get context using existing function
   ask_block = ask_and_gather_context(
     repo,
@@ -137,7 +137,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
           max_tokens: 2048,
           stream: proc do |chunk, _bytesize|
             edit_suggestions_response += chunk["choices"].first["text"]
-            print chunk["choices"].first["text"]
+            logme chunk["choices"].first["text"]
             if edit_suggestions_response.include?("END_RESPONSE")
               throw :close
             end
@@ -145,7 +145,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
         }
       )
     end
-    puts
+    logme
     edit_suggestions_response = edit_suggestions_response.force_encoding('UTF-8')
 
     edit_suggestions_response.split("\n").each do |line|
@@ -173,7 +173,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
             rationale: rationale
           }
         end
-        puts "Found edit location: #{file}:#{range} # #{rationale}"
+        logme "Found edit location: #{file}:#{range} # #{rationale}"
       end
     end
   end
@@ -188,9 +188,9 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     file_path = File.join(repo.workdir, file)
     next unless File.exist?(file_path)
 
-    puts "Processing edit for #{file} lines #{location[:start_line] + 1}-#{location[:end_line] + 1}"
+    logme "Processing edit for #{file} lines #{location[:start_line] + 1}-#{location[:end_line] + 1}"
 
-    puts "Gathering additional context for edit #{file} lines #{location[:start_line] + 1}-#{location[:end_line] + 1}"
+    logme "Gathering additional context for edit #{file} lines #{location[:start_line] + 1}-#{location[:end_line] + 1}"
 
     initial_prompt = <<~PROMPT
     You are tasked to fix build errors after a failed merge attempt.
@@ -228,7 +228,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
       edit_block += "%#{max_lineno_length}d %s\n" % [i + 1, file_content[i]]
     end
 
-    puts "Blaming commit for #{file}:#{location[:start_line]}"
+    logme "Blaming commit for #{file}:#{location[:start_line]}"
     blamed_commit_oid = ""
     blamed_commit_msg_first_line = ""
     blamed_commit_str_numbered = "<not available>"
@@ -245,12 +245,12 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
       #if blamed_commit_oid == first_commit_in_repo_oid
         blamed_commit_oid = ""
         blamed_commit_str_numbered = "<first commit in repository, too large to display>"
-        puts "Blamed commit: #{blamed_commit_oid}"
+        logme "Blamed commit: #{blamed_commit_oid}"
         blamed_commit = repo.lookup(blamed_commit_oid)
       end
     rescue => e
-      #puts "Failed to get blamed commit for #{file}:#{location[:start_line]}: #{e.message}"
-      #puts e.backtrace
+      #logme "Failed to get blamed commit for #{file}:#{location[:start_line]}: #{e.message}"
+      #logme e.backtrace
     end
     unless blamed_commit.nil?
       blamed_commit_msg_first_line = blamed_commit.message.split("\n").first
@@ -273,7 +273,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
       end
       blamed_commit_str_numbered = blamed_commit_str_numbered.force_encoding('UTF-8')        
     end
-    puts "Blamed commit str length: #{blamed_commit_str_numbered.split("\n").size}"
+    logme "Blamed commit str length: #{blamed_commit_str_numbered.split("\n").size}"
 
     edit_prompt_cache = <<~PROMPT
     You are tasked to fix build errors after a failed merge attempt.
@@ -348,7 +348,7 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
           max_tokens: 512,
           stream: proc do |chunk, _bytesize|
             response += chunk["choices"].first["text"]
-            print chunk["choices"].first["text"]
+            logme chunk["choices"].first["text"]
 
             block_marker_count = response.split("\n").select { |line| line.start_with?("```") }.size
             
@@ -383,23 +383,23 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     solution_end = solution_numbered_hash.keys.max
     
     if solution_numbered_hash.empty?
-      puts "Failed - solution empty, response was: \n#{response}"
+      logme "Failed - solution empty, response was: \n#{response}"
       redo
     end
 
     # Validate line numbers:
     # Test overlap
     p location
-    puts "Solution start: #{solution_start}, end: #{solution_end}"
+    logme "Solution start: #{solution_start}, end: #{solution_end}"
     unless solution_start <= location[:end_line] && location[:start_line] <= solution_end
-      puts "Failed - solution does not overlap with location"
+      logme "Failed - solution does not overlap with location"
       redo
     end
     
 
 
     #if error
-    #  puts "Failed - solution has missing line numbers"
+    #  logme "Failed - solution has missing line numbers"
     #  next
     #end
 
@@ -434,15 +434,15 @@ def fixup_iteration(llmc, temperature, repo, sha, build_output, last_patch_str, 
     begin
       File.open(file_path, 'w') { |f| f.write(new_content.join("\n") + "\n") }
       repo.index.add(file)
-      puts "Successfully applied changes to #{file}"
+      logme "Successfully applied changes to #{file}"
       true
     rescue => e
-      puts "Failed to apply changes to #{file}: #{e.message}"
-      puts e.backtrace
+      logme "Failed to apply changes to #{file}: #{e.message}"
+      logme e.backtrace
       redo
     end
   end
 
-  puts "fixup_iteration completed"
+  logme "fixup_iteration completed"
   { success: true, changes: [] }
 end
