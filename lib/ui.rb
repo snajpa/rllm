@@ -1017,7 +1017,7 @@ if __FILE__ == $PROGRAM_NAME
   ui.post_event(cmd: :update_status, message: "Status changed from main... press Home/End in a subpane")
 
   # Wait, then stop
-  sleep(10)
+  sleep(999)
   ui.post_event(:stop)
   ui.join
   puts "Main thread: UI has shut down."
