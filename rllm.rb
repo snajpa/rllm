@@ -138,6 +138,7 @@ class AppUi
     @log += "\n" unless @log.end_with?("\n")
     @meta_tree_data["Root"][:ui_content] = @log.split("\n")
     update_tree
+    update_status @log.split("\n").last
   end
 
   def update_status(message)
@@ -156,7 +157,7 @@ class AppUi
   end
 end
 
-$ui = AppUi.new(false,
+$ui = AppUi.new(ARGV.empty?,
   { "Root" => { :ui_content => ["Initializing..."], :children => {} } },
   "Initializing..."
 )

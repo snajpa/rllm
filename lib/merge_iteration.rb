@@ -339,64 +339,73 @@ def merge_iteration(llmc, temperature, repo, reset_target, dst_branch_name, src_
       while ed.alive?
         logme
         logme
-        # Prepare request
-        uri = URI(LLAMA_API_ENDPOINT_GOOD_SLOW + '/v1/completions')
-        http = Net::HTTP.new(uri.host, uri.port)
-        http.open_timeout = 900
-        http.read_timeout = 900
-        
-        request = Net::HTTP::Post.new(uri)
-        request['Content-Type'] = 'application/json'
-        
-        request.body = JSON.generate({
-          temperature: 0.25,
-          prompt: prompt_common + prompt_mergeblock + ed.out,
+        prompt = prompt_common + prompt_mergeblock + ed.out
+        params = {
           max_tokens: 256,
-          #grammar: gen_gbnf_ed(cmdType),
+          prompt: prompt,
           grammar: File.read("lib/ed.gbnf"),
-          n_probs: 3,
-          stream: true
-        })
+          stop_words: ["# EXECUTE"],
+        }
+        # Prepare request
+        begin
+          uri = URI(LLAMA_API_ENDPOINT_GOOD_SLOW + '/v1/completions')
+          http = Net::HTTP.new(uri.host, uri.port)
+          http.open_timeout = 900
+          http.read_timeout = 900
+          
+          request = Net::HTTP::Post.new(uri)
+          request['Content-Type'] = 'application/json'
+          
+          request.body = JSON.generate({
+            temperature: temperature,
+            n_probs: 3,
+            stream: true
+          }.merge(params))
 
-        response = ""
-        cancel = false
-        http.request(request) do |http_response|
-        http_response.read_body do |chunk|
-          begin
-            redo if chunk.empty?
-            redo unless chunk.start_with?('data: ')
-            data = chunk[6..-1]
-            json = JSON.parse(data)
-            text = json["choices"].first["text"]
-            if text
-              
-              response += text
-              $ui.infer_log text # stream to console
-              $ui.infer_log_logprobs \
-                json["choices"].
-                first["logprobs"]["content"].
-                first["top_logprobs"].
-                map { |v| "(%32s %.2f) " % [v["token"].
-                                                        gsub("\n","\\n").
-                                                        gsub("\t","\\t"), v["logprob"]] }.
-                    join(" ") + "\n"
+          response = ""
+          cancel = false
+          http.request(request) do |http_response|
+            http_response.read_body do |chunk|
+              redo if chunk.empty?
+              redo unless chunk.start_with?('data: ')
+              data = chunk[6..-1]
+              json = JSON.parse(data)
+              text = json["choices"].first["text"]
+              if text            
+                response += text
+                $ui.infer_log text # stream to console
+                if json["choices"].nil? || \
+                       json["choices"].first.nil? || \
+                       json["choices"].first["logprobs"].nil? || \
+                       json["choices"].first["logprobs"]["top_logprobs"].nil? || \
+                       json["choices"].first["logprobs"]["top_logprobs"].empty?
+                else
+                  $ui.infer_log_logprobs \
+                    json["choices"].
+                    first["logprobs"]["content"].
+                    first["top_logprobs"].
+                    map { |v| next if v.nil?; "%32s %.2f " % [v["token"].join(" ").
+                                                            gsub("\n","\\n").
+                                                            gsub("\t","\\t"), v["logprob"]] } \
+                    + "\n"
+                end
               end
             end
-          rescue => e
-            $stderr.puts "Error: #{e.message}"
-            $stderr.puts e.backtrace
-            exit
-            cancel = true
-            break
+            break if cancel
+            logme response
+            logme
+            logme "============================="
+            logme
+            ed.cmd response
+            logme ed.out
           end
+        rescue => e
+          $stderr.puts "Error: #{e.message}"
+          $stderr.puts e.backtrace
+          exit
+          cancel = true
+          break
         end
-        break if cancel
-        logme response
-        logme
-        logme "============================="
-        logme
-        ed.cmd response
-        logme ed.out
       end
 
       pending_merge_blocks -= 1
