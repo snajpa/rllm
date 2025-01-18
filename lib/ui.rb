@@ -78,22 +78,28 @@ module Widgets
 end
 
 ###############################################################################
-# Top SubPanes
+# Top SubPanes (with Word Wrap + Tail Mode behavior)
 ###############################################################################
 module Widgets
   class TopSubPanes < Base
     attr_accessor :focus_index, :headers, :contents,
                   :scroll_offsets, :active,
-                  :tail_modes # parallel array for each subpane
+                  :tail_modes,    # parallel array for each subpane
+                  :word_wrap,
+                  :original_tail_modes # store original tail-mode upon focus
 
     def initialize(num_panes = 3)
       super()
       @headers        = Array.new(num_panes) { |i| "Pane #{i+1}" }
       @contents       = Array.new(num_panes) { ["Default Content"] }
       @scroll_offsets = Array.new(num_panes, 0)
-      @tail_modes     = Array.new(num_panes, true) # tail mode default ON
+      @tail_modes     = Array.new(num_panes, true)  # tail mode default ON
       @focus_index    = 0
       @active         = false
+      @word_wrap      = false
+
+      # We'll store each subpane's "original tail mode" to restore on focus exit
+      @original_tail_modes = Array.new(num_panes, false)
     end
 
     def num_panes
@@ -105,6 +111,7 @@ module Widgets
       @contents << content_lines
       @scroll_offsets << 0
       @tail_modes << true
+      @original_tail_modes << false
       auto_scroll_to_bottom(num_panes - 1)  # if tail mode is on by default
     end
 
@@ -114,6 +121,7 @@ module Widgets
       @contents.delete_at(index)
       @scroll_offsets.delete_at(index)
       @tail_modes.delete_at(index)
+      @original_tail_modes.delete_at(index)
       # Adjust focus_index
       @focus_index = [@focus_index, num_panes - 1].min
       @focus_index = 0 if num_panes <= 0
@@ -138,6 +146,22 @@ module Widgets
     def set_tail_mode(index, enabled)
       return if index < 0 || index >= num_panes
       @tail_modes[index] = !!enabled
+    end
+
+    #
+    # Called by the UI when we focus a subpane => store current tail_mode as "original"
+    #
+    def set_original_tail_mode(i, val)
+      return unless i >= 0 && i < num_panes
+      @original_tail_modes[i] = val
+    end
+
+    #
+    # Called by the UI when we lose focus => restore the original tail mode
+    #
+    def restore_original_tail_mode(i)
+      return unless i >= 0 && i < num_panes
+      @tail_modes[i] = @original_tail_modes[i]
     end
 
     def resize(total_rows, total_cols)
@@ -180,56 +204,135 @@ module Widgets
         interior_height = @height - 2
         text_area_height= interior_height - 1
         text_start_y    = 2
+
         draw_subpane_text(i, sub_left, text_start_y, sub_width, text_area_height)
       end
 
       @win.refresh
     end
 
+    #
+    # Handle user input for the active subpane. 
+    # We only disable tail mode once the user scrolls manually.
+    # If user presses End => jump to bottom, re-enable tail if the original was true.
+    #
     def handle_input(ch)
       return unless @active
 
       idx = @focus_index
       case ch
-      when Curses::KEY_PPAGE
-        page_up(idx)
-      when Curses::KEY_NPAGE
-        page_down(idx)
+      when Curses::KEY_HOME
+        # Jump to top
+        @scroll_offsets[idx] = 0
+        # If we had tail mode on, user is now manually scrolling => turn it off
+        @tail_modes[idx] = false if @tail_modes[idx]
+
+      when Curses::KEY_END
+        # Jump to bottom
+        auto_scroll_to_bottom(idx)
+        # If original tail mode was true => turn it back on
+        if @original_tail_modes[idx]
+          @tail_modes[idx] = true
+        end
+
       when Curses::KEY_UP
         single_line_up(idx)
+        @tail_modes[idx] = false if @tail_modes[idx]
+
       when Curses::KEY_DOWN
         single_line_down(idx)
+        @tail_modes[idx] = false if @tail_modes[idx]
+
+      when Curses::KEY_PPAGE
+        page_up(idx)
+        @tail_modes[idx] = false if @tail_modes[idx]
+
+      when Curses::KEY_NPAGE
+        page_down(idx)
+        @tail_modes[idx] = false if @tail_modes[idx]
       end
     end
 
     private
 
     #
+    # -- WORD WRAP CHANGES --
+    # Split each "raw line" into multiple lines if it exceeds max_width,
+    # but try to break on word boundaries.
+    #
+    def wrap_line(line, max_width)
+      return [line] if line.length <= max_width || max_width < 1
+
+      words = line.split(/(\s+)/)  # keep whitespace tokens so we can rebuild
+      wrapped = []
+      current = ""
+
+      words.each do |w|
+        # If adding this word would exceed max_width, push current and reset
+        if (current + w).length > max_width
+          wrapped << current.rstrip unless current.empty?
+          current = w.lstrip
+        else
+          current += w
+        end
+      end
+      wrapped << current.rstrip unless current.empty?
+
+      wrapped
+    end
+
+    # Return the entire wrapped content for subpane i
+    def wrapped_content_for_pane(i, max_width)
+      return @contents[i] unless @word_wrap
+
+      all_wrapped = []
+      @contents[i].each do |raw_line|
+        all_wrapped.concat(wrap_line(raw_line, max_width))
+      end
+      all_wrapped
+    end
+
+    #
     # Auto-scroll subpane i so the "latest lines" are visible
     # (like a "tail" of a log).
     #
     def auto_scroll_to_bottom(i)
-      displayable = [@height - 3, 1].max
-      needed_offset = @contents[i].size - displayable
+      subpane_width = @width / num_panes
+      # If it's the last pane, we might have leftover width
+      if i == (num_panes - 1)
+        subpane_width = @width - (subpane_width * (num_panes - 1))
+      end
+
+      max_width       = subpane_width - 2
+      lines_wrapped   = wrapped_content_for_pane(i, max_width)
+      displayable     = [@height - 3, 1].max
+      needed_offset   = lines_wrapped.size - displayable
       @scroll_offsets[i] = needed_offset < 0 ? 0 : needed_offset
     end
 
     def draw_subpane_text(idx, sub_left, text_start_y, sub_width, text_area_height)
-      lines       = @contents[idx]
-      scroll_off  = @scroll_offsets[idx]
+      max_width       = sub_width - 2
+      lines_wrapped   = wrapped_content_for_pane(idx, max_width)
+      scroll_off      = @scroll_offsets[idx]
+
+      # clamp scroll offset in case wrapping changed line count
+      if scroll_off > lines_wrapped.size - 1
+        scroll_off = lines_wrapped.size - 1
+        scroll_off = 0 if scroll_off < 0
+        @scroll_offsets[idx] = scroll_off
+      end
+
       visible_end = scroll_off + text_area_height - 1
 
       line_y = text_start_y
       (scroll_off..visible_end).each do |line_idx|
-        break if line_idx >= lines.size
+        break if line_idx >= lines_wrapped.size
 
-        line_str   = lines[line_idx]
-        x_offset   = sub_left + 1
-        max_length = sub_width - 2
-        truncated  = line_str[0, max_length]
+        line_str = lines_wrapped[line_idx]
+        x_offset = sub_left + 1
+        truncated = line_str[0, max_width]
 
         @win.setpos(line_y, x_offset)
-        # We'll just use default text color 3
         @win.attron(Curses.color_pair(3)) do
           @win.addstr(truncated)
         end
@@ -245,9 +348,12 @@ module Widgets
     end
 
     def page_down(i)
-      page_size   = @height - 3
-      lines_count = @contents[i].size
-      max_offset  = [lines_count - page_size, 0].max
+      page_size       = @height - 3
+      subpane_width   = @width / num_panes
+      subpane_width   = @width - (subpane_width * (num_panes - 1)) if i == (num_panes - 1)
+      max_width       = subpane_width - 2
+      lines_wrapped   = wrapped_content_for_pane(i, max_width)
+      max_offset      = [lines_wrapped.size - page_size, 0].max
       @scroll_offsets[i] = [@scroll_offsets[i] + page_size, max_offset].min
     end
 
@@ -256,9 +362,12 @@ module Widgets
     end
 
     def single_line_down(i)
-      page_size   = @height - 3
-      lines_count = @contents[i].size
-      max_offset  = [lines_count - page_size, 0].max
+      page_size       = @height - 3
+      subpane_width   = @width / num_panes
+      subpane_width   = @width - (subpane_width * (num_panes - 1)) if i == (num_panes - 1)
+      max_width       = subpane_width - 2
+      lines_wrapped   = wrapped_content_for_pane(i, max_width)
+      max_offset      = [lines_wrapped.size - page_size, 0].max
       @scroll_offsets[i] = [@scroll_offsets[i] + 1, max_offset].min
     end
   end
@@ -321,20 +430,27 @@ module Widgets
 end
 
 ###############################################################################
-# Bottom Pane (scrollable)
+# Bottom Pane (scrollable, word wrap, tail-mode logic)
 ###############################################################################
 module Widgets
   class ContentPane < Base
     attr_accessor :lines, :scroll_offset, :active,
-                  :auto_update_enabled, :tail_mode
+                  :auto_update_enabled, :tail_mode,
+                  :word_wrap
+
+    # We'll store the "original" tail mode from the moment we gain focus
+    attr_accessor :original_tail_mode
 
     def initialize
       super()
-      @lines                = ["Bottom default line"]
-      @scroll_offset        = 0
-      @active               = false
-      @auto_update_enabled  = true  # If false, we won't overwrite from tree
-      @tail_mode            = true  # Tail mode on by default
+      @lines               = ["Bottom default line"]
+      @scroll_offset       = 0
+      @active              = false
+      @auto_update_enabled = true  # If false, we won't overwrite from tree
+      @tail_mode           = true  # Tail mode on by default
+      @word_wrap           = false
+
+      @original_tail_mode  = false
     end
 
     def resize(total_rows, total_cols)
@@ -353,14 +469,24 @@ module Widgets
       border_color = @active ? 6 : 3
       draw_box(0, 0, @width, @height, border_color)
 
+      # If tail_mode is still on, we auto-scroll to bottom
+      scroll_if_tail_mode
+
       interior_height = @height - 2
-      visible_end     = scroll_offset + interior_height - 1
+      visible_end     = @scroll_offset + interior_height - 1
+
+      max_w      = @width - 2
+      wrapped    = all_wrapped_lines(max_w)
+
+      # clamp scroll offset if wrapping changed line count
+      if @scroll_offset > wrapped.size - 1
+        @scroll_offset = [wrapped.size - 1, 0].max
+      end
 
       line_y = 1
-      (scroll_offset..visible_end).each do |line_idx|
-        break if line_idx >= @lines.size
-
-        truncated = @lines[line_idx][0, @width - 2]
+      ( @scroll_offset..visible_end ).each do |line_idx|
+        break if line_idx >= wrapped.size
+        truncated = wrapped[line_idx][0, max_w]
         draw_text(line_y, 1, truncated, 3)
         line_y += 1
       end
@@ -368,44 +494,117 @@ module Widgets
       @win.refresh
     end
 
+    #
+    # This method receives keyboard events only if @active is true.
+    #
     def handle_input(ch)
       return unless @active
+
       case ch
-      when Curses::KEY_PPAGE
-        page_up
-      when Curses::KEY_NPAGE
-        page_down
+      when Curses::KEY_HOME
+        # Jump to top
+        @scroll_offset = 0
+        # If tail mode was on, user scrolled => turn it off
+        @tail_mode = false if @tail_mode
+
+      when Curses::KEY_END
+        # Jump to bottom
+        scroll_to_bottom
+        # If original tail mode was true => re-enable
+        @tail_mode = true if @original_tail_mode
+
       when Curses::KEY_UP
         single_line_up
+        @tail_mode = false if @tail_mode
+
       when Curses::KEY_DOWN
         single_line_down
+        @tail_mode = false if @tail_mode
+
+      when Curses::KEY_PPAGE
+        page_up
+        @tail_mode = false if @tail_mode
+
+      when Curses::KEY_NPAGE
+        page_down
+        @tail_mode = false if @tail_mode
       end
+
       $stderr.puts "DEBUG BOTTOM KEY => #{ch.inspect}"
     end
 
     #
-    # Replaces lines. If @tail_mode is true, auto-scroll to bottom.
+    # Replaces lines. We'll scroll to bottom if tail_mode is on in render.
     #
     def set_lines(new_lines)
       @lines = new_lines
-      # If tail_mode is enabled, jump to last page
-      if @tail_mode
-        displayable = [@height - 2, 1].max
-        needed_offset = @lines.size - displayable
-        @scroll_offset = (needed_offset < 0) ? 0 : needed_offset
-      end
+    end
+
+    #
+    # For the UI to restore tail mode after losing focus
+    #
+    def restore_original_tail_mode
+      @tail_mode = @original_tail_mode
     end
 
     private
 
+    #
+    # Word wrap logic
+    #
+    def wrap_line(line, max_width)
+      return [line] if line.length <= max_width || max_width < 1
+
+      words = line.split(/(\s+)/)
+      wrapped = []
+      current = ""
+
+      words.each do |w|
+        if (current + w).length > max_width
+          wrapped << current.rstrip unless current.empty?
+          current = w.lstrip
+        else
+          current += w
+        end
+      end
+      wrapped << current.rstrip unless current.empty?
+      wrapped
+    end
+
+    def all_wrapped_lines(max_width)
+      return @lines unless @word_wrap
+
+      result = []
+      @lines.each do |raw_line|
+        result.concat(wrap_line(raw_line, max_width))
+      end
+      result
+    end
+
+    def scroll_to_bottom
+      max_w        = @width - 2
+      wrapped      = all_wrapped_lines(max_w)
+      displayable  = [@height - 2, 1].max
+      needed_offset = wrapped.size - displayable
+      needed_offset = 0 if needed_offset < 0
+      @scroll_offset = needed_offset
+    end
+
+    def scroll_if_tail_mode
+      return unless @tail_mode
+      scroll_to_bottom
+    end
+
     def page_up
-      page_size = @height - 2
+      page_size    = @height - 2
       @scroll_offset = [@scroll_offset - page_size, 0].max
     end
 
     def page_down
-      page_size   = @height - 2
-      max_offset  = [@lines.size - page_size, 0].max
+      page_size    = @height - 2
+      max_w        = @width - 2
+      wrapped      = all_wrapped_lines(max_w)
+      max_offset   = [wrapped.size - page_size, 0].max
       @scroll_offset = [@scroll_offset + page_size, max_offset].min
     end
 
@@ -414,8 +613,10 @@ module Widgets
     end
 
     def single_line_down
-      page_size  = @height - 2
-      max_offset = [@lines.size - page_size, 0].max
+      page_size   = @height - 2
+      max_w       = @width - 2
+      wrapped     = all_wrapped_lines(max_w)
+      max_offset  = [wrapped.size - page_size, 0].max
       @scroll_offset = [@scroll_offset + 1, max_offset].min
     end
   end
@@ -467,19 +668,14 @@ class NcursesUI
     @content_pane = content_pane
     @status_bar   = status_bar
 
-    # node_lookup => node_name => { :ui_content => [...], :children => {}, :other_keys => ... }
+    # node_lookup => node_name => { :ui_content => [...], :children => {}, ... }
     @node_lookup  = node_lookup
 
-    # -- Modified: focus on the tree pane at start
-    @focus_state  = @top_panes.num_panes # This is 3 if num_panes = 3
+    # Start focusing on the tree pane
+    @focus_state  = @top_panes.num_panes # e.g. 3
     @prev_focus_state = nil
     @running      = false
     @event_queue  = Queue.new
-
-    # We'll store the original tail-mode states so we can restore them
-    # whenever a pane loses focus after we've forced tail-mode off.
-    @top_panes_original_tail = Array.new(@top_panes.num_panes, false)
-    @bottom_original_tail    = false
   end
 
   def start
@@ -575,10 +771,8 @@ class NcursesUI
 
     # Detect if focus changed from the previously-focused pane
     if @focus_state != @prev_focus_state
-      # First, restore tail mode for whichever pane was losing focus
-      restore_tail_mode(@prev_focus_state)
-      # Then, disable tail mode if needed for the newly focused pane
-      disable_tail_mode_if_needed(@focus_state)
+      pane_lost_focus(@prev_focus_state)   unless @prev_focus_state.nil?
+      pane_gained_focus(@focus_state)      unless @focus_state.nil?
       @prev_focus_state = @focus_state
     end
 
@@ -597,6 +791,40 @@ class NcursesUI
     @content_pane.active     = (@focus_state == bottom_state)
   end
 
+  #
+  # Focus logic:
+  #
+  # - 'pane_gained_focus' => store the pane's "original" tail mode
+  #   (but do NOT forcibly disable anything)
+  # - 'pane_lost_focus'   => restore tail mode to original
+  #
+  def pane_gained_focus(state)
+    return if state.nil?
+    if state < @top_panes.num_panes
+      i = state
+      original = @top_panes.tail_modes[i]
+      @top_panes.set_original_tail_mode(i, original)
+    elsif state == @top_panes.num_panes
+      # tree pane => no tail mode logic
+    else
+      # bottom pane
+      @content_pane.original_tail_mode = @content_pane.tail_mode
+    end
+  end
+
+  def pane_lost_focus(state)
+    return if state.nil?
+    if state < @top_panes.num_panes
+      i = state
+      @top_panes.restore_original_tail_mode(i)
+    elsif state == @top_panes.num_panes
+      # tree pane => nothing
+    else
+      # bottom
+      @content_pane.restore_original_tail_mode
+    end
+  end
+
   def render_widgets
     @top_panes.render
     @tree_pane.render
@@ -608,51 +836,6 @@ class NcursesUI
 
     @content_pane.render
     @status_bar.render
-  end
-
-  #
-  # Temporarily disable tail mode if it's enabled on the new focus
-  #
-  def disable_tail_mode_if_needed(state)
-    return if state.nil?
-    if state < @top_panes.num_panes
-      # It's one of the top subpanes
-      i = state
-      @top_panes_original_tail[i] = @top_panes.tail_modes[i]
-      if @top_panes.tail_modes[i]
-        @top_panes.set_tail_mode(i, false)
-      end
-    elsif state == @top_panes.num_panes
-      # This is the tree pane => do nothing
-      return
-    else
-      # This must be the bottom pane
-      @bottom_original_tail = @content_pane.tail_mode
-      if @content_pane.tail_mode
-        @content_pane.tail_mode = false
-      end
-    end
-  end
-
-  #
-  # Restore the original tail mode if the old focus had it turned on
-  #
-  def restore_tail_mode(state)
-    return if state.nil?
-    if state < @top_panes.num_panes
-      i = state
-      if @top_panes_original_tail[i]
-        @top_panes.set_tail_mode(i, true)
-      end
-    elsif state == @top_panes.num_panes
-      # Tree pane => do nothing
-      return
-    else
-      # Bottom pane
-      if @bottom_original_tail
-        @content_pane.tail_mode = true
-      end
-    end
   end
 
   def set_bottom_content_from_tree
@@ -690,7 +873,7 @@ class NcursesUI
   end
 
   #
-  # This is where you handle all updates from main
+  # This is where you handle updates from the main thread
   #
   def handle_hash_event(event)
     case event[:cmd]
@@ -759,12 +942,9 @@ class NcursesUI
     case ch
     when 'q'
       stop
-      #exit
     # Tab can be ASCII 9, "\t" or KEY_BTAB
     when 9, "\t", Curses::KEY_BTAB
-      # We have top_panes.num_panes subpane states, then tree, then bottom
       max_focus = @top_panes.num_panes + 1
-      # e.g. 3 subpanes => states 0..2 => tree=3 => bottom=4
       @focus_state = (@focus_state + 1) % (max_focus + 1)
 
     else
@@ -797,9 +977,9 @@ if __FILE__ == $PROGRAM_NAME
     }
   }
 
-  # For demonstration, add lines to the Root
-  60.times do |i|
-    meta_tree_data["Root"][:ui_content] << "Root line #{i}"
+  # Add lines to show wrapping, etc.
+  15.times do |i|
+    meta_tree_data["Root"][:ui_content] << "Root line #{i} with a bunch of extra words to demonstrate word wrapping"
   end
 
   # Build TTY::Tree data & node lookup
@@ -812,6 +992,10 @@ if __FILE__ == $PROGRAM_NAME
   content_pane = Widgets::ContentPane.new
   status_bar   = Widgets::StatusBar.new
 
+  # Optional: enable word wrap for demonstration
+  top_panes.word_wrap    = true
+  content_pane.word_wrap = true
+
   # Create the UI
   ui = NcursesUI.new(
     top_panes:    top_panes,
@@ -823,36 +1007,17 @@ if __FILE__ == $PROGRAM_NAME
 
   ui.start
 
-  # Some demonstration updates
-  sleep(3)
-  ui.post_event(cmd: :update_status, message: "Status changed from main...")
-
-  # 1) Update top pane #0 with lines => auto-scroll (tail mode default on)
-  sleep(3)
-  lines_for_pane0 = (1..20).map { |n| "Top Pane #0 line #{n}" }
-  ui.post_event(cmd: :update_top_pane, index: 0, header: "Pane #1 updated", ui_content: lines_for_pane0)
-
-  # 2) We'll disable tail mode for that top pane #0
-  sleep(3)
-  ui.post_event(cmd: :disable_tail_mode_top, index: 0)
-
-  # 3) Another update => see it no longer jumps to bottom
-  sleep(3)
+  lines_for_pane0 = 120.times.map { |i| "Line #{i} for Pane" }
   more_lines_for_pane0 = lines_for_pane0 + ["New line A", "New line B"]
   ui.post_event(cmd: :update_top_pane, index: 0, header: "Still Pane #1", ui_content: more_lines_for_pane0)
   ui.post_event(cmd: :update_top_pane, index: 1, header: "Still Pane #2", ui_content: more_lines_for_pane0)
 
-  # 4) Toggle bottom pane's tail mode off
+  # Some demonstration updates
   sleep(3)
-  ui.post_event(cmd: :disable_tail_mode_bottom)
-  ui.post_event(cmd: :update_bottom_content, lines: (1..150).map { |i| "Bottom line => #{i}" })
+  ui.post_event(cmd: :update_status, message: "Status changed from main... press Home/End in a subpane")
 
-  # 5) Re-enable tail mode bottom
-  sleep(3)
-  ui.post_event(cmd: :enable_tail_mode_bottom)
-
-  # Wait a bit, then stop
-  sleep(5)
+  # Wait, then stop
+  sleep(10)
   ui.post_event(:stop)
   ui.join
   puts "Main thread: UI has shut down."
